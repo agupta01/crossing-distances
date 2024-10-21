@@ -115,8 +115,8 @@ def get_osm_crossings(city: str):
             non_walk.append((u, v, k))
 
     G.remove_edges_from(non_walk)
-    G = ox.utils_graph.remove_isolated_nodes(G)
-    G = ox.simplify_graph(G)
+    # G = ox.utils_graph.remove_isolated_nodes(G)
+    # G = ox.simplify_graph(G)
 
     # Calculate and print total edge length
     stats = ox.stats.basic_stats(G)

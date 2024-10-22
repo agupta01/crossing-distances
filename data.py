@@ -5,7 +5,10 @@ from collections import namedtuple
 
 app = modal.App("crossing-distances")
 
-osmnx_image = modal.Image.from_dockerfile(path="./Dockerfile")
+image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .pip_install("segment-geospatial", "timm==1.0.9")
+)
 
 dataset_volume = modal.Volume.from_name("crosswalk-data", create_if_missing=True)
 
@@ -54,33 +57,35 @@ def create_logger():
     logger = logging.getLogger(__name__)
 
     formatter = logging.Formatter(
-        fmt="$(asctime)s | %(levelname)-8s | %(module)s:%(lineno)d | %(message)s",
+        fmt="%(asctime)s %(levelname)-8s %(module)s:%(lineno)d %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S%z",
     )
     handler = logging.StreamHandler()
 
     handler.setFormatter(formatter)
     logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
 
     return logger
 
-@app.function(image=osmnx_image, volumes={"/data": dataset_volume})
+@app.function(image=image, volumes={"/data": dataset_volume})
 def get_image_for_crosswalk(lat: float, long: float):
     from datetime import datetime
     from uuid import uuid4
     from samgeo import tms_to_geotiff, choose_device, geotiff_to_jpg
 
     logger = create_logger()
-
+    
     logger.info(f"Executing function for coordinate ({lat}, {long})")
 
     new_coords = coords_from_distance(lat, long, dist=25.0, heading=180)
-    logger.info(f"New Coords: ({new_coords.lat}, {new_coords.long})")
+    logger.warning(f"New Coords: ({new_coords.lat}, {new_coords.long})")
 
 @app.local_entrypoint()
 def main(mode: str):
     coords = [Coordinate(lat=0.0, long=0.0), Coordinate(lat=1.0, long=-1.0)]
     if mode.lower() == "remote":
         get_image_for_crosswalk.for_each(*zip(*coords))
+        # get_image_for_crosswalk.remote(0.0, 0.0)
     else:
-        list(map(get_image_for_crosswalk, *zip(*coords)))
+        list(map(get_image_for_crosswalk.local, *zip(*coords)))

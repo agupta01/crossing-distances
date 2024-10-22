@@ -6,4 +6,6 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "modal>=0.64.151",
+    "segment-geospatial>=0.12.2",
+    "timm==1.0.9",
 ]

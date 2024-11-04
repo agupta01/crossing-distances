@@ -6,7 +6,7 @@ from collections import namedtuple
 app = modal.App("crossing-distances")
 
 image = (
-    modal.Image.debian_slim(python_version="3.11")
+    modal.Image.from_registry("gboeing/osmnx:latest")
     .pip_install("segment-geospatial", "timm==1.0.9")
 )
 
@@ -68,24 +68,53 @@ def create_logger():
 
     return logger
 
+
 @app.function(image=image, volumes={"/data": dataset_volume})
 def get_image_for_crosswalk(lat: float, long: float):
     from datetime import datetime
     from uuid import uuid4
-    from samgeo import tms_to_geotiff, choose_device, geotiff_to_jpg
-
+    import math
+    from samgeo import tms_to_geotiff
     logger = create_logger()
-    
     logger.info(f"Executing function for coordinate ({lat}, {long})")
 
-    new_coords = coords_from_distance(lat, long, dist=25.0, heading=180)
-    logger.warning(f"New Coords: ({new_coords.lat}, {new_coords.long})")
+    radius = 25.0 # meters
+
+    crosswalk_id = str(uuid4())
+    filename = os.path.join("/", "data", f"crosswalk_{crosswalk_id}.tif")
+
+    # Build bounding box based on radius
+    diag_radius = math.sqrt(2) * radius
+    top_left = coords_from_distance(lat, long, diag_radius, 315)
+    bottom_right = coords_from_distance(lat, long, diag_radius, 135)
+    bounding_box = [bottom_right.long, bottom_right.lat, top_left.long, top_left.lat]
+
+    tms_to_geotiff(
+        output=filename, 
+        bbox=bounding_box, 
+        crs="EPSG:3857", 
+        zoom=22, 
+        source="Satellite", 
+        overwrite=True, 
+        quiet=True
+    )
+    dataset_volume.commit()
+
+    return crosswalk_id
+
 
 @app.local_entrypoint()
-def main(mode: str):
-    coords = [Coordinate(lat=0.0, long=0.0), Coordinate(lat=1.0, long=-1.0)]
+def main(mode: str, sample: int, input: str):
+    import os
+    import pandas as pd
+    coords = pd.read_csv(input).sample(n=sample).apply(lambda c: (c.y, c.x), axis=1).tolist()
     if mode.lower() == "remote":
-        get_image_for_crosswalk.for_each(*zip(*coords))
+        ids = get_image_for_crosswalk.map(*zip(*coords), return_exceptions=True)
         # get_image_for_crosswalk.remote(0.0, 0.0)
     else:
-        list(map(get_image_for_crosswalk.local, *zip(*coords)))
+        ids = list(map(get_image_for_crosswalk.local, *zip(*coords)))
+
+    # dump IDs to json
+    os.makedirs("outputs", exist_ok=True)
+    pd.DataFrame(index=ids, data=coords, columns=["lat", "long"]).to_csv(f"outputs/id_to_coords_sf.csv")
+

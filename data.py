@@ -1,120 +1,133 @@
 import modal
-import os
-from typing import Optional, Tuple
-from collections import namedtuple
+
+from utils import PRECISION, coords_from_distance, create_logger, get_crosswalk_id
 
 app = modal.App("crossing-distances")
 
-image = (
+sam_image = (
     modal.Image.from_registry("gboeing/osmnx:latest")
     .pip_install("segment-geospatial", "timm==1.0.9")
+    .env({"TINI_SUBREAPER": "1"})
 )
 
-dataset_volume = modal.Volume.from_name("crosswalk-data", create_if_missing=True)
+committer_image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .pip_install("pillow")
+    .env({"TINI_SUBREAPER": "1"})
+)
 
-Coordinate = namedtuple("Coordinate", ["lat", "long"])
+dataset_volume = modal.Volume.from_name("crosswalk-data-sf", create_if_missing=True)
 
-def coords_from_distance(lat: float, long: float, dist: float, heading: float) -> Coordinate:
-    """
-    Return the lat/long coordinates after traveling a certain distance from
-    some original coordinates at a specified compass heading.
-    """
+redrive_dict = modal.Dict.from_name("crosswalk-data-sf-redrive", create_if_missing=True)
+
+
+@app.function(image=committer_image, timeout=86400)
+def task_dispatcher(lats: list[float], longs: list[float], batch_size=1000):
     import math
-    # Convert latitude and longitude to radians
-    lat_rad = math.radians(lat)
-    long_rad = math.radians(long)
+    from itertools import batched
 
-    # Convert heading to radians
-    heading_rad = math.radians(heading)
+    logger = create_logger()
+    logger.info(f"Received {len(lats)} coordinates.")
 
-    # Earth's radius in meters
-    earth_radius = 6371000
+    lats_batcher = batched(lats, batch_size)
+    longs_batcher = batched(longs, batch_size)
+    num_batches = math.ceil(len(lats) / batch_size)
 
-    # Calculate angular distance
-    angular_distance = dist / earth_radius
+    save_calls: list[modal.functions.FunctionCall] = []
+    for i, (lat_batch, long_batch) in enumerate(zip(lats_batcher, longs_batcher)):
+        logger.info(f"[BATCH {i}/{num_batches}] contains {len(lat_batch)} coordinates.")
+        ids_and_raw_images = list(
+            get_image_for_crosswalk.map(lat_batch, long_batch, return_exceptions=True)
+        )
+        logger.info("Images pulled. Starting save task...")
+        save_calls.append(commit_images_to_volume.spawn(ids_and_raw_images))
 
-    # Calculate new latitude
-    new_lat_rad = math.asin(
-        math.sin(lat_rad) * math.cos(angular_distance) +
-        math.cos(lat_rad) * math.sin(angular_distance) * math.cos(heading_rad)
-    )
-
-    # Calculate new longitude
-    new_long_rad = long_rad + math.atan2(
-        math.sin(heading_rad) * math.sin(angular_distance) * math.cos(lat_rad),
-        math.cos(angular_distance) - math.sin(lat_rad) * math.sin(new_lat_rad)
-    )
-
-    # Convert new latitude and longitude back to degrees
-    new_lat = math.degrees(new_lat_rad)
-    new_long = math.degrees(new_long_rad)
-
-    return Coordinate(lat=new_lat, long=new_long)
-
-def create_logger():
-    import logging
-
-    logger = logging.getLogger(__name__)
-
-    formatter = logging.Formatter(
-        fmt="%(asctime)s %(levelname)-8s %(module)s:%(lineno)d %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S%z",
-    )
-    handler = logging.StreamHandler()
-
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
-
-    return logger
+    # wait for all save calls to finish
+    modal.functions.gather(*save_calls)
 
 
-@app.function(image=image, volumes={"/data": dataset_volume})
+@app.function(image=committer_image, volumes={"/data": dataset_volume}, timeout=3600)
+def commit_images_to_volume(ids_and_raw_images):
+    logger = create_logger()
+
+    # convert images to JPEG files with filenames as ids
+    saved_files = []
+    for j, data in enumerate(ids_and_raw_images):
+        if isinstance(data, Exception):
+            logger.warning(f"Unhandled Exception found: {data}. Logging to redrive.")
+            redrive_dict[
+                f"{modal.current_input_id()}_{modal.current_function_call_id()}_{j}"
+            ] = data
+            continue
+        crosswalk_id, image_data = data
+        if isinstance(image_data, Exception):
+            logger.warning(
+                f"Exception found: {image_data} for coordinates {crosswalk_id}. Logging to redrive."
+            )
+            redrive_dict[crosswalk_id] = image_data
+            continue
+        filename = f"/data/crosswalk_{crosswalk_id}.jpeg"
+        image_data.convert("RGB").save(filename, "JPEG", optimize=True, keep_rgb=True)
+        saved_files.append(filename)
+        logger.info(f"Saved file {j} of {len(ids_and_raw_images)} in batch.")
+    # commit volume
+    dataset_volume.commit()
+    logger.info(f"Saved {len(saved_files)} to volume.")
+
+
+@app.function(image=sam_image)
 def get_image_for_crosswalk(lat: float, long: float):
-    from datetime import datetime
-    from uuid import uuid4
     import math
+
     from samgeo import tms_to_geotiff
+
     logger = create_logger()
     logger.info(f"Executing function for coordinate ({lat}, {long})")
 
-    radius = 25.0 # meters
+    radius = 25.0  # meters
 
-    crosswalk_id = str(uuid4())
-    filename = os.path.join("/", "data", f"crosswalk_{crosswalk_id}.tif")
+    try:
+        crosswalk_id = get_crosswalk_id(lat, long)
 
-    # Build bounding box based on radius
-    diag_radius = math.sqrt(2) * radius
-    top_left = coords_from_distance(lat, long, diag_radius, 315)
-    bottom_right = coords_from_distance(lat, long, diag_radius, 135)
-    bounding_box = [bottom_right.long, bottom_right.lat, top_left.long, top_left.lat]
+        # Build bounding box based on radius
+        diag_radius = math.sqrt(2) * radius
+        top_left = coords_from_distance(lat, long, diag_radius, 315)
+        bottom_right = coords_from_distance(lat, long, diag_radius, 135)
+        bounding_box = [
+            bottom_right.long,
+            bottom_right.lat,
+            top_left.long,
+            top_left.lat,
+        ]
 
-    tms_to_geotiff(
-        output=filename, 
-        bbox=bounding_box, 
-        crs="EPSG:3857", 
-        zoom=22, 
-        source="Satellite", 
-        overwrite=True, 
-        quiet=True
-    )
-    dataset_volume.commit()
-
-    return crosswalk_id
+        image_data = tms_to_geotiff(
+            output="./scratch.tif",
+            bbox=bounding_box,
+            crs="EPSG:3857",
+            zoom=22,
+            source="Esri.WorldImagery",
+            overwrite=True,
+            quiet=True,
+            return_image=True,
+        )
+    except Exception as e:
+        return ((lat, long), e)
+    else:
+        return crosswalk_id, image_data
 
 
 @app.local_entrypoint()
-def main(mode: str, sample: int, input: str):
-    import os
+def main(mode: str, input: str, sample: int = 1000, batch_size: int = 1000):
     import pandas as pd
-    coords = pd.read_csv(input).sample(n=sample).apply(lambda c: (c.y, c.x), axis=1).tolist()
+
+    df = pd.read_csv(input)
+    coords = (
+        df.sample(n=sample if sample > 0 else len(df))
+        .apply(lambda c: (round(c.y, PRECISION), round(c.x, PRECISION)), axis=1)
+        .tolist()
+    )
+
     if mode.lower() == "remote":
-        ids = get_image_for_crosswalk.map(*zip(*coords), return_exceptions=True)
-        # get_image_for_crosswalk.remote(0.0, 0.0)
+        task_dispatcher.remote(*zip(*coords), batch_size=batch_size)
     else:
-        ids = list(map(get_image_for_crosswalk.local, *zip(*coords)))
-
-    # dump IDs to json
-    os.makedirs("outputs", exist_ok=True)
-    pd.DataFrame(index=ids, data=coords, columns=["lat", "long"]).to_csv(f"outputs/id_to_coords_sf.csv")
-
+        task_dispatcher.local(*zip(*coords), batch_size=batch_size)

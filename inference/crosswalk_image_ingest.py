@@ -1,8 +1,9 @@
 import modal
-
 from utils import PRECISION, coords_from_distance, create_logger, get_crosswalk_id
+from dotenv import dotenv_values
 
-app = modal.App("crossing-distances")
+config = dotenv_values("./.env")
+app = modal.App("crossing-distances-image-pull")
 
 sam_image = (
     modal.Image.from_registry("gboeing/osmnx:latest")
@@ -16,9 +17,11 @@ committer_image = (
     .env({"TINI_SUBREAPER": "1"})
 )
 
-dataset_volume = modal.Volume.from_name("crosswalk-data-sf", create_if_missing=True)
+dataset_volume = modal.Volume.from_name(f"crosswalk-data-{config["CITY_CODE"]}", create_if_missing=True)
 
-redrive_dict = modal.Dict.from_name("crosswalk-data-sf-redrive", create_if_missing=True)
+redrive_dict = modal.Dict.from_name(
+    f"crosswalk-data-{config["CITY_CODE"]}-redrive", create_if_missing=True
+)
 
 
 @app.function(image=committer_image, timeout=86400)
@@ -105,7 +108,7 @@ def get_image_for_crosswalk(lat: float, long: float):
             bbox=bounding_box,
             crs="EPSG:3857",
             zoom=22,
-            source="Esri.WorldImagery",
+            source="Satellite",
             overwrite=True,
             quiet=True,
             return_image=True,
@@ -114,6 +117,19 @@ def get_image_for_crosswalk(lat: float, long: float):
         return ((lat, long), e)
     else:
         return crosswalk_id, image_data
+
+
+@app.function(image=committer_image, timeout=86400)
+def remote(city_code: str, sample: int = 1000, batch_size: int = 1000):
+    import modal
+    import pandas as pd
+
+    # same thing as main() just gets data from modal volume
+    outputs_vol = modal.Volume.lookup("outputs", environment_name=city_code)
+    # TODO: get coords file from volume
+    coords_file = None
+    
+    task_dispatcher.call()
 
 
 @app.local_entrypoint()
@@ -126,6 +142,7 @@ def main(mode: str, input: str, sample: int = 1000, batch_size: int = 1000):
         .apply(lambda c: (round(c.y, PRECISION), round(c.x, PRECISION)), axis=1)
         .tolist()
     )
+    # TODO: filter coordinates that have existing images in the volume
 
     if mode.lower() == "remote":
         task_dispatcher.remote(*zip(*coords), batch_size=batch_size)

@@ -1,4 +1,4 @@
-from utils import decode_crosswalk_id, get_crosswalk_id
+from inference.utils import decode_crosswalk_id, get_crosswalk_id
 
 
 def test_encode_decode_crosswalk_id():

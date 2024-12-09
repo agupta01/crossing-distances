@@ -22,7 +22,7 @@ def pipeline():
     # Get raw data and prep it (orange + blue)
     pm.execute_notebook(
         input_path="/src/osm_ingest.ipynb",
-        output_path=f'/outputs/osm_ingest-{execution_start_time.strftime("%Y-%m-%d %H:%M:%S")}.ipynb',
+        output_path=f'/outputs/osm_ingest-{execution_start_time.strftime("%Y-%m-%dT%H:%M:%S")}.ipynb',
     )
 
     # Get images based on coordinates file (purple)
@@ -34,13 +34,13 @@ def pipeline():
     # Produce mask shapefiles from images (red + yellow)
     pm.execute_notebook(
         input_path="/src/sam_inference.ipynb",
-        output_path=f"/outputs/sam_inference-{execution_start_time.strftime("%Y-%m-%d %H:%M:%S")}.ipynb",
+        output_path=f"/outputs/sam_inference-{execution_start_time.strftime("%Y-%m-%dT%H:%M:%S")}.ipynb",
     )
 
     # Compute corrected crosswalks using masks
     pm.execute_notebook(
         input_path="/src/grow_cut.ipynb",
-        output_path=f"/outputs/grow_cut-{execution_start_time.strftime("%Y-%m-%d %H:%M:%S")}.ipynb",
+        output_path=f"/outputs/grow_cut-{execution_start_time.strftime("%Y-%m-%dT%H:%M:%S")}.ipynb",
     )
 
 

@@ -1,9 +1,6 @@
 from pathlib import Path
+import os
 import modal
-
-token_file = Path.home() / ".github_pat"
-with open(token_file, "r") as f:
-    github_token = f.read().strip()
 
 app = modal.App("crossing-distances-sam2-fine-tuning")
 train_image = (
@@ -17,7 +14,7 @@ train_image = (
         "pycocotools~=2.0.8",
         "matplotlib~=3.9.2",
     )
-    .run_commands(f"git clone https://{github_token}@github.com/facebookresearch/sam2.git")
+    .run_commands(f"git clone https://git@github.com/facebookresearch/sam2.git")
     .run_commands("pip install -e sam2/.")
     .run_commands("pip install -e 'sam2/.[dev]'")
     .run_commands("cd 'sam2/checkpoints'; ./download_ckpts.sh")

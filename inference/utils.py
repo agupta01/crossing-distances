@@ -2,9 +2,6 @@ import logging
 import math
 from collections import namedtuple
 import modal
-from rasterio.coords import BoundingBox
-from shapely.geometry import box
-import geopandas as gpd
 
 Coordinate = namedtuple("Coordinate", ["lat", "long"])
 PRECISION = 6  # decimal points = 111mm resolution

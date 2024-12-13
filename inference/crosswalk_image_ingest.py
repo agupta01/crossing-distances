@@ -1,5 +1,5 @@
 import modal
-from utils import PRECISION, coords_from_distance, create_logger, get_crosswalk_id
+from inference.utils import PRECISION, RADIUS, coords_from_distance, create_logger, get_crosswalk_id
 from dotenv import dotenv_values
 
 config = dotenv_values("./.env")
@@ -87,7 +87,7 @@ def get_image_for_crosswalk(lat: float, long: float):
     logger = create_logger()
     logger.info(f"Executing function for coordinate ({lat}, {long})")
 
-    radius = 25.0  # meters
+    radius = RADIUS  # meters
 
     try:
         crosswalk_id = get_crosswalk_id(lat, long)
@@ -128,7 +128,7 @@ def remote(city_code: str, sample: int = 1000, batch_size: int = 1000):
     outputs_vol = modal.Volume.lookup("outputs", environment_name=city_code)
     # TODO: get coords file from volume
     coords_file = None
-    
+
     task_dispatcher.call()
 
 

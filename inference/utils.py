@@ -1,12 +1,19 @@
 import logging
 import math
 from collections import namedtuple
+import modal
+from rasterio.coords import BoundingBox
+from shapely.geometry import box
+import geopandas as gpd
 
 Coordinate = namedtuple("Coordinate", ["lat", "long"])
 PRECISION = 6  # decimal points = 111mm resolution
+RADIUS = 25.0 # meters. Default size of an intersection
 trunc_explanation = (
     "Values must be truncated so that decoding returns the original value."
 )
+
+osmnx_image = modal.Image.from_registry("gboeing/osmnx:latest")
 
 
 def coords_from_distance(
@@ -92,4 +99,27 @@ def decode_crosswalk_id(crosswalk_id: str) -> Coordinate:
     return Coordinate(
         lat=n_s_hemisphere * int(raw_lat[:-1]) / (10**PRECISION),
         long=e_w_hemisphere * int(raw_long[:-1]) / (10**PRECISION),
+    )
+
+def bounding_box_from_filename(filename: str) -> tuple[float, float, float, float]:
+    """Returns a bounding box from the file name, assuming a 25 meter radius around the center.
+
+    Returns as tuple (
+            bottom_right.long,
+            bottom_right.lat,
+            top_left.long,
+            top_left.lat,
+        )
+    """
+    center = decode_crosswalk_id(filename.split(".")[0].split("_", 1)[1])
+
+    diag_radius = math.sqrt(2) * RADIUS
+    top_left = coords_from_distance(center.lat, center.long, diag_radius, 315)
+    bottom_right = coords_from_distance(center.lat, center.long, diag_radius, 135)
+
+    return (
+        bottom_right.long,
+        bottom_right.lat,
+        top_left.long,
+        top_left.lat,
     )

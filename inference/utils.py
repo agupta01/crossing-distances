@@ -3,6 +3,7 @@ import math
 from collections import namedtuple
 import modal
 
+app = modal.App("crossing-distances")
 Coordinate = namedtuple("Coordinate", ["lat", "long"])
 PRECISION = 6  # decimal points = 111mm resolution
 RADIUS = 25.0 # meters. Default size of an intersection

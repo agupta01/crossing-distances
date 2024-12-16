@@ -1,9 +1,8 @@
 import modal
-from inference.utils import PRECISION, RADIUS, coords_from_distance, create_logger, get_crosswalk_id
+from inference.utils import PRECISION, RADIUS, coords_from_distance, create_logger, get_crosswalk_id, app
 from dotenv import dotenv_values
 
 config = dotenv_values("./.env")
-app = modal.App("crossing-distances-image-pull")
 
 sam_image = (
     modal.Image.from_registry("gboeing/osmnx:latest")

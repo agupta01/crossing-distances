@@ -18,6 +18,7 @@ The tasks are as follows:
 - `osm_ingest.ipynb` (Orange + Blue): Pulls raw data from OpenStreetMap for the city and modifies the OSM results to produce a list of crosswalks that need to be analyzed
   - Inputs: None
   - Outputs: crosswalk_edges.shp (shapefile of lines), intersection_coordinates.csv (index, x, y points for all intersections with crosswalks in study area), raw_intersection_coordinates.csv (index, x, y points for all intersections in study area)
+  - Example: `MODAL_ENVIRONMENT=sfo uv run modal run inference/osm_ingest.py::osm_ingest --place "San Francisco, CA, USA"`
 - `crosswalk_image_ingest.py` (Purple): pulls JPEGs of crosswalk images into Modal volume for city
   - Inputs: coordinates.csv
   - Outputs: None (images committed to modal volume `crosswalk-data-{CITY_CODE}` in `CITY_CODE` environment)
@@ -25,7 +26,8 @@ The tasks are as follows:
   - Inputs: None (pulls SAM weights from Modal)
   - Outputs: crosswalk_masks.shp (contains polygons of each drivable area mask in study area)
 - `grow_cut.ipynb` (Green): runs the grow-cut algorithm on the polygons to fix crosswalks
-  - Inputs: crosswalk_masks.shp, raw_crosswalks.shp
-  - Outputs: corrected_crosswalks.shp (shapefile of lines)
+  - Inputs: cross_walks.geojson, crosswalk_edges.shp
+  - Outputs: refined_crosswalks.geojson
+  - Example: `MODAL_ENVIRONMENT=sfo uv run modal run inference/grow_cut.py::grow_cut`
 
-Generally, all inputs will go in the city's `inputs` volume, and all outputs will go in the city's `outputs` volume.
+Generally, all data artifacts will go in a city's `scratch` volume.

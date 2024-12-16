@@ -1,7 +1,6 @@
 import modal
-from inference.utils import osmnx_image, RADIUS
+from inference.utils import osmnx_image, RADIUS, app
 
-app = modal.App("crossing-distance-inference")
 scratch_volume = modal.Volume.from_name("scratch", create_if_missing=True)
 
 @app.function(

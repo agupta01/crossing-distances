@@ -10,7 +10,7 @@ trunc_explanation = (
     "Values must be truncated so that decoding returns the original value."
 )
 
-osmnx_image = modal.Image.from_registry("gboeing/osmnx:latest")
+osmnx_image = modal.Image.from_registry("gboeing/osmnx:latest").env({"TINI_SUBREAPER": "1"})
 
 
 def coords_from_distance(

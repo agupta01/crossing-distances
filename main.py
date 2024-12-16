@@ -1,8 +1,7 @@
 import modal
+from inference.utils import osmnx_image
 
 app = modal.App("crossing-distances")
-
-osmnx_image = modal.Image.from_dockerfile(path="./Dockerfile")
 
 
 def setup_argparser():

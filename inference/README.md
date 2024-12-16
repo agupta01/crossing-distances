@@ -17,7 +17,7 @@ The `entrypoint.py` file is used to orchestrate these tasks using Modal and pape
 The tasks are as follows:
 - `osm_ingest.ipynb` (Orange + Blue): Pulls raw data from OpenStreetMap for the city and modifies the OSM results to produce a list of crosswalks that need to be analyzed
   - Inputs: None
-  - Outputs: raw_crosswalks.shp (shapefile of lines), coordinates.csv (index, x, y points for all crosswalks in study area)
+  - Outputs: crosswalk_edges.shp (shapefile of lines), intersection_coordinates.csv (index, x, y points for all intersections with crosswalks in study area), raw_intersection_coordinates.csv (index, x, y points for all intersections in study area)
 - `crosswalk_image_ingest.py` (Purple): pulls JPEGs of crosswalk images into Modal volume for city
   - Inputs: coordinates.csv
   - Outputs: None (images committed to modal volume `crosswalk-data-{CITY_CODE}` in `CITY_CODE` environment)

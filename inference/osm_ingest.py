@@ -1,12 +1,11 @@
 import modal
-from main import osmnx_image
+from inference.utils import osmnx_image, RADIUS
 
 app = modal.App("crossing-distance-inference")
 scratch_volume = modal.Volume.from_name("scratch", create_if_missing=True)
 
 @app.function(
     volumes={"/scratch": scratch_volume},
-    mounts=[modal.Mount.from_local_dir("./", remote_path="/src")],
     image=osmnx_image
 )
 def osm_ingest(place: str):
@@ -87,6 +86,7 @@ def osm_ingest(place: str):
             non_walk.append((u, v, k))
 
     G.remove_edges_from(non_walk)
+    G = ox.simplify_graph(G, edge_attrs_differ=['osmid'])
 
     # Next, get the intersections
     G_drive = ox.graph_from_place(
@@ -94,18 +94,34 @@ def osm_ingest(place: str):
         network_type="drive",
         custom_filter=f'[\"highway\"~\"{"|".join(highway_subtypes)}\"]'
     )
+    G_drive = ox.project_graph(G_drive)
     all_intersections = ox.consolidate_intersections(G_drive, rebuild_graph=False, dead_ends=False)
+
+    # Save the intersection coordinates
+    all_intersections.to_crs("EPSG:4326").get_coordinates().to_csv("/scratch/raw_intersection_coordinates.csv")
 
     # Filter intersections to only those with pedestrian crossings within 15m
     # of the intersection. This is done using a spatial join between the nodes GDF from intersections and the edges GDF from G
-    crosswalk_edges_gdf = ox.graph_to_gdfs(G, nodes=False, edges=True)
-    all_intersections_gdf = gpd.GeoDataFrame(all_intersections, columns=["geometry"], crs=all_intersections.crs)
+    crosswalk_edges_gdf = ox.graph_to_gdfs(G, nodes=False, edges=True).to_crs("EPSG:3857")
+    crosswalk_edges_gdf.drop_duplicates("osmid", inplace=True)
 
-    # Buffer the crosswalk edges by 15m
-    crosswalk_edges_gdf["geometry"] = crosswalk_edges_gdf["geometry"].buffer(15)
+    # Save crosswalk edges
+    crosswalk_edges_gdf.to_file("/scratch/crosswalk_edges.shp")
+
+    all_intersections_gdf = gpd.GeoDataFrame(all_intersections, columns=["geometry"], crs=all_intersections.crs).to_crs("EPSG:3857")
 
     # Perform the spatial join
-    intersections_with_crosswalks = gpd.sjoin(all_intersections_gdf, crosswalk_edges_gdf, how="inner", op="intersects")
+    intersections_with_crosswalks = gpd.sjoin_nearest(
+        all_intersections_gdf[["geometry"]],
+        crosswalk_edges_gdf[["geometry"]],
+        how="inner",
+        max_distance=RADIUS,
+        distance_col="d"
+    )
 
-    # Save result as shapefile
-    intersections_with_crosswalks.to_file("intersections_with_crosswalks.shp")
+    # Save result as csv
+    intersections_with_crosswalks = intersections_with_crosswalks.drop_duplicates("geometry").to_crs("EPSG:4326")
+    intersections_with_crosswalks["x"] = intersections_with_crosswalks.geometry.x
+    intersections_with_crosswalks["y"] = intersections_with_crosswalks.geometry.y
+
+    intersections_with_crosswalks[["x", "y"]].to_csv("/scratch/intersection_coordinates.csv")

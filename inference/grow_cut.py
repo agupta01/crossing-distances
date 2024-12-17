@@ -1,12 +1,14 @@
 import modal
-from inference.utils import app, osmnx_image, create_logger
 from shapely.geometry import LineString, MultiLineString, Polygon
+
+from inference.utils import app, create_logger, osmnx_image
 
 scratch_volume = modal.Volume.from_name("scratch", create_if_missing=True)
 
+
 def get_spanning_line(multiline):
-    from shapely.geometry import MultiLineString, LineString
     import numpy as np
+    from shapely.geometry import LineString, MultiLineString
 
     if not isinstance(multiline, MultiLineString):
         raise ValueError("Input must be a shapely MultiLineString")
@@ -24,7 +26,10 @@ def get_spanning_line(multiline):
     # Create the spanning LineString
     return LineString([tuple(coords_array[min_x_idx]), tuple(coords_array[max_x_idx])])
 
-def get_line_spans_within_polygon(polygon: Polygon, line: LineString, buffer: float = 0.25, limit: int = 4) -> list:
+
+def get_line_spans_within_polygon(
+    polygon: Polygon, line: LineString, buffer: float = 0.25, limit: int = 4
+) -> list:
     """
     Computes all segments of a line that lie within a polygon, accounting for non-convex shapes and holes.
 
@@ -38,8 +43,10 @@ def get_line_spans_within_polygon(polygon: Polygon, line: LineString, buffer: fl
     Returns:
     - list of LineString: A list of LineStrings representing each segment of the line within the polygon.
     """
-    from shapely.geometry import LineString, MultiLineString
     import math
+
+    import numpy as np
+    from shapely.geometry import LineString, MultiLineString
 
     logger = create_logger()
 
@@ -53,7 +60,7 @@ def get_line_spans_within_polygon(polygon: Polygon, line: LineString, buffer: fl
     # Calculate direction vector
     dx = x2 - x1
     dy = y2 - y1
-    length = math.hypot(dx, dy)
+    length = line.length
 
     if length == 0:
         raise ValueError("The provided line is a single point.")
@@ -63,7 +70,9 @@ def get_line_spans_within_polygon(polygon: Polygon, line: LineString, buffer: fl
     dy /= length
 
     # Extend the line far beyond the polygon bounds
-    extension_length = max(maxx - minx, maxy - miny) * buffer  # Arbitrary large extension
+    extension_length = (
+        max(maxx - minx, maxy - miny) * buffer
+    )  # Arbitrary large extension
 
     new_start = (x1 - dx * extension_length, y1 - dy * extension_length)
     new_end = (x2 + dx * extension_length, y2 + dy * extension_length)
@@ -82,19 +91,45 @@ def get_line_spans_within_polygon(polygon: Polygon, line: LineString, buffer: fl
         spans.append(intersection)
     elif isinstance(intersection, MultiLineString):
         if len(intersection.geoms) > limit:
-            logger.info(f"{len(intersection.geoms)} segments detected. Simplifying...")
+            # logger.info(f"{len(intersection.geoms)} segments detected. Simplifying...")
             spans.append(get_spanning_line(intersection))
         else:
             for segment in intersection.geoms:
                 spans.append(segment)
     else:
         raise ValueError("Unexpected intersection type.")
+    return spans
+
+
+@app.function(image=osmnx_image)
+def compute_grow_cut(row):
+    # Extract the row
+    _, row = row
+
+    logger = create_logger()
+
+    # Extract the crosswalk polygon and edge
+    crosswalk_polygon = row["crosswalk_polygon"]
+    crosswalk_edge = row["geometry"]
+    logger.info(
+        f"Geometric intersection length {crosswalk_edge.intersection(crosswalk_polygon).length}"
+    )
+    logger.info(f"Length before correction: {crosswalk_edge.length}")
+    # Compute the spans
+    spans = get_line_spans_within_polygon(crosswalk_polygon, crosswalk_edge)
+    if isinstance(spans, list):
+        logger.info(f"Length after correction: {sum(span.length for span in spans)}")
+    else:
+        logger.info(f"Length after correction: {spans.length}")
 
     return spans
+
 
 @app.function(
     image=osmnx_image,
     volumes={"/scratch": scratch_volume},
+    timeout=86400,
+    cpu=4,
 )
 def grow_cut():
     """Runs the grow-cut algorithm on the crosswalks to refine their boundaries.
@@ -106,6 +141,9 @@ def grow_cut():
     Outputs:
         refined_crosswalks.geojson: GeoJSON file containing the refined crosswalks
     """
+    import time
+    from itertools import chain
+
     import geopandas as gpd
 
     logger = create_logger()
@@ -113,16 +151,42 @@ def grow_cut():
     masks = gpd.read_file("/scratch/cross_walks.geojson").to_crs("EPSG:3857")
     crosswalks = gpd.read_file("/scratch/crosswalk_edges.shp").to_crs("EPSG:3857")
 
-    spans = []
+    logger.info(
+        f"Found {len(crosswalks)} crosswalks to refine. Matching to intersections..."
+    )
+    start = time.time()
+    crosswalks_to_intersections = (
+        crosswalks[["osmid", "geometry"]]
+        .sjoin(masks, how="left", predicate="intersects")
+        .dropna(subset=["index_right"])
+        .merge(
+            masks.reset_index().rename(
+                columns={"geometry": "crosswalk_polygon", "index": "index_right"}
+            )[["index_right", "crosswalk_polygon"]],
+            on="index_right",
+        )
+    )
+    logger.info(
+        f"Matched {len(crosswalks_to_intersections)} crosswalks to intersections. Time: {time.time() - start:.2f}s"
+    )
 
-    # TODO: map this if scalability becomes a concern
-    for idx, row in crosswalks.iterrows():
-        # Find the polygon which contains any part of the linestring
-        match = masks.loc[masks.geometry.intersects(row.geometry)]
-        if len(match):
-            logger.info(f"found one! @ {idx}, {row['name']}")
-            spans.extend(get_line_spans_within_polygon(match.iloc[0].geometry, row.geometry))
+    spans = compute_grow_cut.map(
+        crosswalks_to_intersections.iterrows(),
+        return_exceptions=True,
+    )
+
+    # Flatten the spans, logging any errors
+    final_spans = []
+    for span in spans:
+        if isinstance(span, Exception):
+            logger.warning(f"Error found: {span}")
+        elif isinstance(span, list):
+            final_spans.extend(span)
+        else:
+            final_spans.append(span)
 
     # Save the refined crosswalks
-    spans_gdf = gpd.GeoDataFrame(geometry=spans, crs="EPSG:3857").to_crs("EPSG:4326")
+    spans_gdf = gpd.GeoDataFrame(geometry=final_spans, crs="EPSG:3857").to_crs(
+        "EPSG:4326"
+    )
     spans_gdf.to_file("/scratch/refined_crosswalks.geojson", driver="GeoJSON")

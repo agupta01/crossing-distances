@@ -1,6 +1,14 @@
 import modal
-from inference.utils import PRECISION, RADIUS, coords_from_distance, create_logger, get_crosswalk_id, app
 from dotenv import dotenv_values
+
+from inference.utils import (
+    PRECISION,
+    RADIUS,
+    app,
+    coords_from_distance,
+    create_logger,
+    get_crosswalk_id,
+)
 
 config = dotenv_values("./.env")
 
@@ -16,7 +24,9 @@ committer_image = (
     .env({"TINI_SUBREAPER": "1"})
 )
 
-dataset_volume = modal.Volume.from_name(f"crosswalk-data-{config["CITY_CODE"]}", create_if_missing=True)
+dataset_volume = modal.Volume.from_name(
+    f"crosswalk-data-{config["CITY_CODE"]}", create_if_missing=True
+)
 
 redrive_dict = modal.Dict.from_name(
     f"crosswalk-data-{config["CITY_CODE"]}-redrive", create_if_missing=True

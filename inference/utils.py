@@ -1,17 +1,20 @@
 import logging
 import math
 from collections import namedtuple
+
 import modal
 
 app = modal.App("crossing-distances")
 Coordinate = namedtuple("Coordinate", ["lat", "long"])
 PRECISION = 6  # decimal points = 111mm resolution
-RADIUS = 25.0 # meters. Default size of an intersection
+RADIUS = 25.0  # meters. Default size of an intersection
 trunc_explanation = (
     "Values must be truncated so that decoding returns the original value."
 )
 
-osmnx_image = modal.Image.from_registry("gboeing/osmnx:latest").env({"TINI_SUBREAPER": "1"})
+osmnx_image = modal.Image.from_registry("gboeing/osmnx:latest").env(
+    {"TINI_SUBREAPER": "1"}
+)
 
 
 def coords_from_distance(
@@ -98,6 +101,7 @@ def decode_crosswalk_id(crosswalk_id: str) -> Coordinate:
         lat=n_s_hemisphere * int(raw_lat[:-1]) / (10**PRECISION),
         long=e_w_hemisphere * int(raw_long[:-1]) / (10**PRECISION),
     )
+
 
 def bounding_box_from_filename(filename: str) -> tuple[float, float, float, float]:
     """Returns a bounding box from the file name, assuming a 25 meter radius around the center.

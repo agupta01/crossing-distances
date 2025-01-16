@@ -5,10 +5,11 @@ from inference.utils import RADIUS, app, osmnx_image
 scratch_volume = modal.Volume.from_name("scratch", create_if_missing=True)
 
 
-@app.function(volumes={"/scratch": scratch_volume}, image=osmnx_image)
+@app.function(volumes={"/scratch": scratch_volume}, image=osmnx_image, timeout=3600)
 def osm_ingest(place: str):
     import geopandas as gpd
     import osmnx as ox
+    import pandas as pd
 
     # Set useful tags for walking network
     useful_tags = ox.settings.useful_tags_way + [
@@ -117,13 +118,24 @@ def osm_ingest(place: str):
 
     # Filter intersections to only those with pedestrian crossings within 15m
     # of the intersection. This is done using a spatial join between the nodes GDF from intersections and the edges GDF from G
-    crosswalk_edges_gdf = ox.graph_to_gdfs(G, nodes=False, edges=True).to_crs(
-        "EPSG:3857"
+    crosswalk_nodes_gdf, crosswalk_edges_gdf = ox.graph_to_gdfs(
+        G, nodes=True, edges=True
     )
+    crosswalk_nodes_gdf = crosswalk_nodes_gdf.to_crs("EPSG:3857")
+    crosswalk_edges_gdf = crosswalk_edges_gdf.to_crs("EPSG:3857")
+    crosswalk_edges_and_nodes_gdf = pd.concat(
+        [
+            crosswalk_edges_gdf.reset_index()[["osmid", "geometry"]],
+            crosswalk_nodes_gdf.reset_index()[["osmid", "geometry"]],
+        ]
+    )
+
     crosswalk_edges_gdf.drop_duplicates("osmid", inplace=True)
+    crosswalk_edges_and_nodes_gdf.drop_duplicates("osmid", inplace=True)
 
     # Save crosswalk edges
-    crosswalk_edges_gdf.to_file("/scratch/crosswalk_edges.shp")
+    # TODO: save the crosswalk_edges_and_nodes_gdf instead once we can grow nodes into edges (shp files can't take mixed geometries)
+    crosswalk_edges_gdf.to_file("/scratch/crosswalk_edges.shp", index=False)
 
     all_intersections_gdf = gpd.GeoDataFrame(
         all_intersections, columns=["geometry"], crs=all_intersections.crs
@@ -132,7 +144,7 @@ def osm_ingest(place: str):
     # Perform the spatial join
     intersections_with_crosswalks = gpd.sjoin_nearest(
         all_intersections_gdf[["geometry"]],
-        crosswalk_edges_gdf[["geometry"]],
+        crosswalk_edges_and_nodes_gdf[["geometry"]],
         how="inner",
         max_distance=RADIUS,
         distance_col="d",

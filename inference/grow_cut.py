@@ -28,7 +28,7 @@ def get_spanning_line(multiline):
 
 
 def get_line_spans_within_polygon(
-    polygon: Polygon, line: LineString, buffer: float = 0.25, limit: int = 4
+    polygon: Polygon, line: LineString, buffer: float = 0.05, limit: int = 4
 ) -> list:
     """
     Computes all segments of a line that lie within a polygon, accounting for non-convex shapes and holes.

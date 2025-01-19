@@ -1,16 +1,47 @@
 import logging
 import math
+import os
 from collections import namedtuple
+from io import BytesIO
+
 import modal
 
-Coordinate = namedtuple("Coordinate", ["lat", "long"])
+app = modal.App("crossing-distances")
+
 PRECISION = 6  # decimal points = 111mm resolution
-RADIUS = 25.0 # meters. Default size of an intersection
+RADIUS = 25.0  # meters. Default size of an intersection
+
+Coordinate = namedtuple("Coordinate", ["lat", "long"])
+
 trunc_explanation = (
     "Values must be truncated so that decoding returns the original value."
 )
 
-osmnx_image = modal.Image.from_registry("gboeing/osmnx:latest").env({"TINI_SUBREAPER": "1"})
+osmnx_image = modal.Image.from_registry("gboeing/osmnx:latest").env(
+    {"TINI_SUBREAPER": "1"}
+)
+
+sam_image = (
+    modal.Image.from_registry("gboeing/osmnx:latest")
+    .pip_install("segment-geospatial", "timm==1.0.9")
+    .env({"TINI_SUBREAPER": "1"})
+)
+
+committer_image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .pip_install("pillow", "pandas")
+    .env({"TINI_SUBREAPER": "1"})
+)
+
+dataset_volume = modal.Volume.from_name(
+    f"crosswalk-data-{os.environ['MODAL_ENVIRONMENT']}", create_if_missing=True
+)
+
+redrive_dict = modal.Dict.from_name(
+    f"crosswalk-data-{os.environ['MODAL_ENVIRONMENT']}-redrive", create_if_missing=True
+)
+
+main_scratch = modal.Volume.from_name("scratch", environment_name="main", create_if_missing=True)
 
 
 def coords_from_distance(
@@ -98,6 +129,7 @@ def decode_crosswalk_id(crosswalk_id: str) -> Coordinate:
         long=e_w_hemisphere * int(raw_long[:-1]) / (10**PRECISION),
     )
 
+
 def bounding_box_from_filename(filename: str) -> tuple[float, float, float, float]:
     """Returns a bounding box from the file name, assuming a 25 meter radius around the center.
 
@@ -120,3 +152,91 @@ def bounding_box_from_filename(filename: str) -> tuple[float, float, float, floa
         top_left.long,
         top_left.lat,
     )
+
+
+def get_from_volume(
+    volume_name: str, file_path: str, environment_name: str | None = None
+) -> BytesIO:
+    volume = modal.Volume.lookup(volume_name, environment_name=environment_name)
+    data = b""
+    for chunk in volume.read_file(file_path):
+        data += chunk
+    return BytesIO(data)
+
+def dist(a, b):
+    return math.sqrt((a[0] - b[0])**2 + (a[1] - b[1])**2)
+
+
+def filter_coordinates(df, city_code, sample, logger, return_length=False, return_df=False):
+    # Sample the dataframe and round coordinates
+    sampled_df = df.sample(n=sample if sample > 0 else len(df))
+    sampled_df['coords'] = sampled_df.apply(
+        lambda row: (round(row.y, PRECISION), round(row.x, PRECISION)),
+        axis=1
+    )
+
+    # Generate filenames for each coordinate
+    sampled_df['filename'] = sampled_df['coords'].apply(
+        lambda coord: f"crosswalk_{get_crosswalk_id(coord[0], coord[1])}.jpeg"
+    )
+
+    # Get the volume
+    dataset_volume = modal.Volume.from_name(
+        f"crosswalk-data-{city_code}",
+        environment_name=city_code,
+    )
+
+    # Get existing files in volume
+    existing_files = set(entry.path.split('/')[-1] for entry in dataset_volume.iterdir("/"))
+
+    # Filter out coordinates whose files already exist
+    filtered_df = sampled_df[~sampled_df['filename'].isin(existing_files)]
+
+    # Get the final set of coordinates
+    filtered_coords = set(filtered_df['coords'].tolist())
+
+    logger.info(
+        f"Found {len(sampled_df) - len(filtered_coords)}, need {len(filtered_coords)} coordinates"
+    )
+
+    if return_length:
+        return len(filtered_coords)
+    elif return_df:
+        return filtered_df
+    return filtered_coords
+
+
+def fuzzy_search_optimized(query: str, string_list: list[str]) -> str:
+    """
+    Performs a fuzzy search to find the string with most matching characters in same positions.
+
+    Args:
+        query: The search string
+        string_list: List of strings to search through (all same length as query)
+
+    Returns:
+        Best matching string from the list
+    """
+    query_length = len(query)
+    max_matches = 0
+    best_match = string_list[0]
+
+    # Pre-compute query bytes
+    query_bytes = query.encode()
+
+    # Pre-compute encoded strings
+    encoded_strings = [s.encode() for s in string_list]
+
+    for candidate_bytes in encoded_strings:
+        # Use byte-level comparison
+        matches = sum(a == b for a, b in zip(query_bytes, candidate_bytes))
+
+        if matches > max_matches:
+            max_matches = matches
+            # Find original string
+            best_match = string_list[encoded_strings.index(candidate_bytes)]
+
+            if matches == query_length:
+                break
+
+    return best_match

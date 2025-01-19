@@ -1,8 +1,8 @@
 import modal
 
-app = modal.App("crossing-distance-inference")
-scratch_volume = modal.Volume.from_name("scratch", create_if_missing=True)
+from inference.utils import app
 
+scratch_volume = modal.Volume.from_name("scratch", create_if_missing=True)
 
 
 @app.function(

@@ -1,5 +1,6 @@
-from pathlib import Path
 import os
+from pathlib import Path
+
 import modal
 
 app = modal.App("crossing-distances-sam2-fine-tuning")
@@ -23,13 +24,22 @@ train_image = (
 weights_volume = modal.Volume.from_name("sam2-weights", create_if_missing=True)
 
 
-@app.function(mounts=[modal.Mount.from_local_dir("../data/configs", remote_path="../sam2/sam2/configs"), 
-                      modal.Mount.from_local_dir("../data/images", remote_path="../sam2/images")], 
-              volumes={"/weights": weights_volume}, image=train_image, gpu="A100", timeout=3600)
+@app.function(
+    mounts=[
+        modal.Mount.from_local_dir(
+            "../data/configs", remote_path="../sam2/sam2/configs"
+        ),
+        modal.Mount.from_local_dir("../data/images", remote_path="../sam2/images"),
+    ],
+    volumes={"/weights": weights_volume},
+    image=train_image,
+    gpu="A100",
+    timeout=3600,
+)
 def run_training(config_path: str):
     import os
-    import subprocess
     import shutil
+    import subprocess
     from pathlib import Path
 
     # Run the training command
@@ -45,13 +55,18 @@ def run_training(config_path: str):
     ]
     subprocess.run(command, check=True)
 
-    weights_dir = Path("../sam2/sam2_logs/modal_results")  # Replace with the actual weights directory
+    weights_dir = Path(
+        "../sam2/sam2_logs/modal_results"
+    )  # Replace with the actual weights directory
     volume_base_dir = Path("/weights")
 
     if weights_dir.exists():
         existing_dirs = [
-            d.name for d in volume_base_dir.iterdir()
-            if d.is_dir() and d.name.startswith("train_") and d.name.split("_")[1].isdigit()
+            d.name
+            for d in volume_base_dir.iterdir()
+            if d.is_dir()
+            and d.name.startswith("train_")
+            and d.name.split("_")[1].isdigit()
         ]
         existing_nums = [int(d.split("_")[1]) for d in existing_dirs]
         next_num = max(existing_nums, default=0) + 1
@@ -72,6 +87,7 @@ def run_training(config_path: str):
         print(f"Saved training outputs to: {new_dir}")
     else:
         print(f"Weights directory {weights_dir} does not exist.")
+
 
 @app.local_entrypoint()
 def main():

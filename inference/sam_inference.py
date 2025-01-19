@@ -1,6 +1,15 @@
 import modal
-from utils import decode_crosswalk_id, coords_from_distance, bounding_box_from_filename
+import os
+from dotenv import load_dotenv
 import math
+from utils import decode_crosswalk_id, coords_from_distance, bounding_box_from_filename
+
+load_dotenv()
+
+CITY_CODE = os.getenv("CITY_CODE")
+
+INPUTS_VOLUME_NAME = f"crosswalk-data-{CITY_CODE}"
+OUTPUTS_VOLUME_NAME = f"{INPUTS_VOLUME_NAME}-results"
 
 app = modal.App(name="crossing-distance-sam2-inference")
 
@@ -17,7 +26,8 @@ infer_image = (
         "supervision",
         "fiona",
         "geopandas",
-        "shapely"
+        "shapely",
+        "python-dotenv"
     )
     .run_commands(f"git clone https://git@github.com/facebookresearch/sam2.git")
     .run_commands("pip install -e sam2/.")
@@ -26,8 +36,8 @@ infer_image = (
 )
 
 weights_volume = modal.Volume.from_name("sam2-weights", create_if_missing=True, environment_name="sam_test")
-inputs_volume = modal.Volume.from_name("crosswalk-data-sf", environment_name="sfo")
-outputs_volume = modal.Volume.from_name("sam2-results", create_if_missing=True, environment_name="sam_test")
+inputs_volume = modal.Volume.from_name(INPUTS_VOLUME_NAME, environment_name=CITY_CODE)
+outputs_volume = modal.Volume.from_name(OUTPUTS_VOLUME_NAME, create_if_missing=True, environment_name=CITY_CODE)
 
 
 @app.function(volumes={"/weights": weights_volume, 
@@ -62,12 +72,12 @@ def run_inference(model_path: str, mode: str):
 
     input_set = os.listdir("/inputs")
 
-    if mode =="test":
+    if mode == "test":
         input_set = random.sample(input_set, min(100, len(input_set)))
     elif mode == "full":
         pass
     else:
-        raise ValueError(f"Invalid mode: {mode}. Must be 'test' or 'full'.")
+        raise ValueError(f"Invalid mode: {mode}. Must be test or full.")
 
     output_dir = f"/outputs/{model_path}"
     geofile_dir = f"/outputs/{model_path}/geofiles" 

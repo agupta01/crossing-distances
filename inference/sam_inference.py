@@ -2,7 +2,7 @@ import modal
 import os
 from dotenv import load_dotenv
 import math
-from utils import decode_crosswalk_id, coords_from_distance, bounding_box_from_filename
+import json
 
 load_dotenv()
 
@@ -11,11 +11,13 @@ CITY_CODE = os.getenv("CITY_CODE")
 INPUTS_VOLUME_NAME = f"crosswalk-data-{CITY_CODE}"
 OUTPUTS_VOLUME_NAME = f"{INPUTS_VOLUME_NAME}-results"
 
+from utils import decode_crosswalk_id, coords_from_distance, bounding_box_from_filename
+
 app = modal.App(name="crossing-distance-sam2-inference")
 
 infer_image = (
     modal.Image.debian_slim(python_version="3.10")
-    .apt_install("git", "wget", "python3-opencv", "ffmpeg")
+    .apt_install("git", "wget", "python3-opencv", "ffmpeg", "build-essential", "ninja-build")
     .pip_install(
         "torch",
         "torchvision",
@@ -27,11 +29,14 @@ infer_image = (
         "fiona",
         "geopandas",
         "shapely",
-        "python-dotenv"
+        "python-dotenv",
+        "wandb"
     )
-    .run_commands(f"git clone https://git@github.com/facebookresearch/sam2.git")
+    .run_commands("git clone https://git@github.com/facebookresearch/sam2.git",
+                  "cd sam2 && python setup.py build_ext --inplace")
     .run_commands("pip install -e sam2/.")
     .run_commands("pip install -e 'sam2/.[dev]'")
+    .run_commands("pip install -e 'sam2/.[notebooks]'")
     .run_commands("cd 'sam2/checkpoints'; ./download_ckpts.sh")
 )
 
@@ -43,8 +48,10 @@ outputs_volume = modal.Volume.from_name(OUTPUTS_VOLUME_NAME, create_if_missing=T
 @app.function(volumes={"/weights": weights_volume, 
                        "/inputs": inputs_volume,
                        "/outputs": outputs_volume}, 
-              image=infer_image, gpu="A100", timeout=36000)
-def run_inference(model_path: str, mode: str):
+              image=infer_image, gpu="A100", 
+              secrets=[modal.Secret.from_name("wandb-secret")],
+              timeout=36000)
+def run_inference(model_path: str, mode: str, city_code: str, negative_points: list = None):
     import torch
     import cv2
     from sam2.build_sam import build_sam2
@@ -59,21 +66,62 @@ def run_inference(model_path: str, mode: str):
     from shapely.validation import make_valid
     from shapely.ops import unary_union
     import json
+    import wandb
+
+    os.environ["WANDB_API_KEY"] = os.environ["WANDB_API_KEY"]
 
     torch.autocast("cuda", dtype=torch.bfloat16).__enter__()
     if torch.cuda.get_device_properties(0).major >= 8:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
+    mask_generator_config = {
+    "points_per_side": 32,  # More granular point grid
+    "pred_iou_thresh": 0.80,  # Slightly more lenient to catch more potential crosswalks
+    "stability_score_thresh": 0.90,  # Slightly more lenient for stability
+    "crop_n_layers": 0,  # No need for crops since crosswalks are usually visible at full resolution
+    "crop_n_points_downscale_factor": 1,
+    "min_mask_region_area": 500,  # Larger minimum area since crosswalks are typically substantial features
+}
+
+    if negative_points:
+        mask_generator_config.update({
+            "point_coords": np.array(negative_points),
+            "point_labels": np.array([0] * len(negative_points)),  # 0 for negative prompts
+        })
+
     checkpoint = f"../../weights/{model_path}/checkpoints/checkpoint.pt"
     model_cfg = "configs/sam2.1/sam2.1_hiera_b+.yaml"
     sam2 = build_sam2(model_cfg, checkpoint, device="cuda")
-    mask_generator = SAM2AutomaticMaskGenerator(sam2)
+    mask_generator = SAM2AutomaticMaskGenerator(sam2, **mask_generator_config)
 
     input_set = os.listdir("/inputs")
 
     if mode == "test":
+        # Set a fixed seed based on the city code for reproducibility 
+        # Convert city code to a numeric seed by summing character ASCII values
+        seed = sum(ord(c) for c in city_code)
+        random.seed(seed)
+        
+        # Random sample with fixed seed
+        input_set = list(input_set)
         input_set = random.sample(input_set, min(100, len(input_set)))
+
+        negative_points_str = "with_neg_points" if negative_points else "no_neg_points"
+        
+        wandb.init(
+            project="pedestrian-crossing-distance",
+            name=f"{city_code}-{model_path}-{negative_points_str}-test",
+            tags=[city_code, negative_points_str],
+            config={
+                "model_path": model_path,
+                "mode": mode,
+                "city_code": city_code,
+                "negative_points": negative_points,
+                "using_negative_points": bool(negative_points)
+            }
+        )
+        wandb_images = []
     elif mode == "full":
         pass
     else:
@@ -112,6 +160,15 @@ def run_inference(model_path: str, mode: str):
         annotated_image_path = os.path.join(output_dir, f"{image_name}_masked.jpg")
         annotated_image_bgr = cv2.cvtColor(annotated_image, cv2.COLOR_RGB2BGR)
         cv2.imwrite(annotated_image_path, annotated_image_bgr)
+
+        if mode == "test":
+            wandb_images.append(
+                wandb.Image(
+                    annotated_image,
+                    caption=f"Masked image: {image_name}"
+                )
+            )
+
 
         final_mask = np.zeros((original_height, original_width), dtype=np.uint8)
         for mask in detections.mask:
@@ -199,7 +256,21 @@ def run_inference(model_path: str, mode: str):
     # Export to Shapefile
     shapefile_path = f"{geofile_dir}/cross_walks.shp"
     gdf.to_file(shapefile_path, driver="ESRI Shapefile")
+
+    if mode == "test":
+        wandb.log({
+            "evaluation_samples": wandb_images  # Log all images in one go
+        })
+        wandb.finish()
                 
 @app.local_entrypoint()
-def main(model: str, mode: str):
-    run_inference.remote(model_path=model, mode=mode)
+def main(model: str, mode: str, negative_points: str = None):
+    city_code = os.environ.get("MODAL_ENVIRONMENT")
+    if not city_code:
+        raise ValueError("MODAL_ENVIRONMENT environment variable must be set")
+
+    neg_points = None
+    if negative_points:
+        neg_points = json.loads(negative_points)
+
+    run_inference.remote(model_path=model, mode=mode, city_code=city_code, negative_points=neg_points)

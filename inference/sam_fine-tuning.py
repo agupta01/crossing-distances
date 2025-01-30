@@ -14,14 +14,16 @@ train_image = (
         "opencv-python==4.10.0.84",
         "pycocotools~=2.0.8",
         "matplotlib~=3.9.2",
+        "wandb",
+        force_build = True
     )
-    .run_commands(f"git clone https://git@github.com/facebookresearch/sam2.git")
+    .run_commands(f"git clone https://git@github.com/DSC-Qian/sam2.git")
     .run_commands("pip install -e sam2/.")
     .run_commands("pip install -e 'sam2/.[dev]'")
     .run_commands("cd 'sam2/checkpoints'; ./download_ckpts.sh")
 )
 
-weights_volume = modal.Volume.from_name("sam2-weights", create_if_missing=True)
+weights_volume = modal.Volume.from_name("sam2-weights", create_if_missing=True, environment_name="sam_test")
 
 
 @app.function(
@@ -33,14 +35,20 @@ weights_volume = modal.Volume.from_name("sam2-weights", create_if_missing=True)
     ],
     volumes={"/weights": weights_volume},
     image=train_image,
-    gpu="A100",
-    timeout=3600,
+    gpu="H100",
+    secrets=[modal.Secret.from_name("wandb-secret")],
+    timeout=36000,
 )
 def run_training(config_path: str):
     import os
     import shutil
     import subprocess
     from pathlib import Path
+
+    # Set up W&B environment
+    os.environ["WANDB_API_KEY"] = os.environ["WANDB_API_KEY"]
+    os.environ["WANDB_PROJECT"] = "pedestrian-crossing-distance"
+    os.environ["WANDB_ENTITY"] = "tonyqian99-new-york-university"
 
     # Run the training command
     command = [

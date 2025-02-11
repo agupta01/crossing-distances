@@ -1,23 +1,36 @@
 import modal
 import os
-from dotenv import load_dotenv
-import math
 import json
+from dotenv import load_dotenv
+import numpy as np
+from PIL import Image
+import cv2
+import geopandas as gpd
+from shapely.geometry import Polygon, box, MultiPolygon
+from shapely.ops import unary_union
 
 load_dotenv()
 
-CITY_CODE = os.getenv("CITY_CODE")
+from utils import decode_crosswalk_id, coords_from_distance, bounding_box_from_filename
 
+IMAGE_SIZE = 1024
+CITY_CODE = os.getenv("CITY_CODE")
 INPUTS_VOLUME_NAME = f"crosswalk-data-{CITY_CODE}"
 OUTPUTS_VOLUME_NAME = f"{INPUTS_VOLUME_NAME}-results"
 
-from utils import decode_crosswalk_id, coords_from_distance, bounding_box_from_filename
+MASK_GENERATOR_CONFIG = {
+    "points_per_side": 32,
+    "pred_iou_thresh": 0.80,
+    "stability_score_thresh": 0.90,
+    "crop_n_layers": 0,
+    "min_mask_region_area": 500,
+}
 
 app = modal.App(name="crossing-distance-sam2-inference")
 
 infer_image = (
     modal.Image.debian_slim(python_version="3.10")
-    .apt_install("git", "wget", "python3-opencv", "ffmpeg", "build-essential", "ninja-build")
+    .apt_install("git", "wget", "python3-opencv", "ffmpeg", "build-essential", "ninja-build", "cmake", "g++")
     .pip_install(
         "torch",
         "torchvision",
@@ -33,17 +46,79 @@ infer_image = (
         "wandb"
     )
     .run_commands("git clone https://git@github.com/facebookresearch/sam2.git",
-                  "cd sam2 && python setup.py build_ext --inplace")
-    .run_commands("pip install -e sam2/.")
-    .run_commands("pip install -e 'sam2/.[dev]'")
-    .run_commands("pip install -e 'sam2/.[notebooks]'")
-    .run_commands("cd 'sam2/checkpoints'; ./download_ckpts.sh")
-)
+        "cd sam2 && rm -rf build",
+        "cd sam2 && python -m pip install -e .",
+        "cd sam2 && python setup.py build_ext --inplace",  # Build C++ extensions
+        "cd sam2 && ln -s build/lib.*/_C*.so sam2/ || true"
+    ))
 
 weights_volume = modal.Volume.from_name("sam2-weights", create_if_missing=True, environment_name="sam_test")
 inputs_volume = modal.Volume.from_name(INPUTS_VOLUME_NAME, environment_name=CITY_CODE)
 outputs_volume = modal.Volume.from_name(OUTPUTS_VOLUME_NAME, create_if_missing=True, environment_name=CITY_CODE)
 
+def bgr_to_rgb(image):
+    """Ensure consistent color conversion from BGR to RGB"""
+    if len(image.shape) == 3 and image.shape[2] == 3:
+        return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    return image
+
+def rgb_to_bgr(image):
+    """Ensure consistent color conversion from RGB to BGR"""
+    if len(image.shape) == 3 and image.shape[2] == 3:
+        return cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+    return image
+
+def draw_negative_buffers(image, negative_points, buffer_size, color=(0, 0, 255)):
+    """Draw negative points and their buffers on the image"""
+    vis_image = image.copy()
+    
+    if negative_points:
+        for x, y in negative_points:
+            if 0 <= x < IMAGE_SIZE and 0 <= y < IMAGE_SIZE:
+                # Draw the buffer circle
+                cv2.circle(vis_image, (x, y), buffer_size, color, 2)
+                # Draw the center point
+                cv2.circle(vis_image, (x, y), 3, color, -1)
+    
+    return vis_image
+
+def process_geometry(contours, original_size, bounding_box):
+    original_width, original_height = original_size
+    valid_polygons = []
+    
+    for contour in contours:
+        if len(contour) < 3:
+            continue
+            
+        geo_points = []
+        for point in contour.squeeze(1):
+            rel_x = point[0] / original_width
+            rel_y = point[1] / original_height
+            lon = rel_x * (bounding_box[0] - bounding_box[2]) + bounding_box[2]
+            lat = rel_y * (bounding_box[1] - bounding_box[3]) + bounding_box[3]
+            geo_points.append((lon, lat))
+        
+        try:
+            polygon = Polygon(geo_points).simplify(0.00001).buffer(0.000001)
+            if polygon.is_valid:
+                valid_polygons.append(polygon)
+        except Exception as e:
+            print(f"Error creating polygon: {e}")
+            continue
+    
+    return valid_polygons
+
+def export_geodata(gdf, output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+    formats = {
+        "geojson": "GeoJSON",
+        "kml": "KML",
+        "shp": "ESRI Shapefile"
+    }
+    
+    for ext, driver in formats.items():
+        path = os.path.join(output_dir, f"cross_walks.{ext}")
+        gdf.to_file(path, driver=driver)
 
 @app.function(volumes={"/weights": weights_volume, 
                        "/inputs": inputs_volume,
@@ -51,7 +126,7 @@ outputs_volume = modal.Volume.from_name(OUTPUTS_VOLUME_NAME, create_if_missing=T
               image=infer_image, gpu="A100", 
               secrets=[modal.Secret.from_name("wandb-secret")],
               timeout=36000)
-def run_inference(model_path: str, mode: str, city_code: str, negative_points: list = None):
+def run_inference(model_path: str, mode: str, city_code: str, negative_points: list = None, buffer_size: int = 20):
     import torch
     import cv2
     from sam2.build_sam import build_sam2
@@ -70,207 +145,125 @@ def run_inference(model_path: str, mode: str, city_code: str, negative_points: l
 
     os.environ["WANDB_API_KEY"] = os.environ["WANDB_API_KEY"]
 
+    # Model initialization
     torch.autocast("cuda", dtype=torch.bfloat16).__enter__()
-    if torch.cuda.get_device_properties(0).major >= 8:
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-
-    mask_generator_config = {
-    "points_per_side": 32,  # More granular point grid
-    "pred_iou_thresh": 0.80,  # Slightly more lenient to catch more potential crosswalks
-    "stability_score_thresh": 0.90,  # Slightly more lenient for stability
-    "crop_n_layers": 0,  # No need for crops since crosswalks are usually visible at full resolution
-    "crop_n_points_downscale_factor": 1,
-    "min_mask_region_area": 500,  # Larger minimum area since crosswalks are typically substantial features
-}
-
-    if negative_points:
-        mask_generator_config.update({
-            "point_coords": np.array(negative_points),
-            "point_labels": np.array([0] * len(negative_points)),  # 0 for negative prompts
-        })
-
-    checkpoint = f"../../weights/{model_path}/checkpoints/checkpoint.pt"
-    model_cfg = "configs/sam2.1/sam2.1_hiera_b+.yaml"
-    sam2 = build_sam2(model_cfg, checkpoint, device="cuda")
-    mask_generator = SAM2AutomaticMaskGenerator(sam2, **mask_generator_config)
-
+    sam2 = build_sam2(
+        "configs/sam2.1/sam2.1_hiera_b+.yaml",
+        f"../../weights/{model_path}/checkpoints/checkpoint.pt",
+        device="cuda"
+    )
+    mask_generator = SAM2AutomaticMaskGenerator(sam2, **MASK_GENERATOR_CONFIG)
+    
+    # Data setup
     input_set = os.listdir("/inputs")
-
+    output_dir = f"/outputs/{model_path}/images"
+    os.makedirs(output_dir, exist_ok=True)
+    
     if mode == "test":
-        # Set a fixed seed based on the city code for reproducibility 
-        # Convert city code to a numeric seed by summing character ASCII values
-        seed = sum(ord(c) for c in city_code)
-        random.seed(seed)
-        
-        # Random sample with fixed seed
-        input_set = list(input_set)
+        collected_images = [] # List to store images for wandb logging
+        random.seed(sum(ord(c) for c in city_code))
         input_set = random.sample(input_set, min(100, len(input_set)))
 
-        negative_points_str = "with_neg_points" if negative_points else "no_neg_points"
-        
+    # WANDB initialization
+    if mode == "test":
         wandb.init(
             project="pedestrian-crossing-distance",
-            name=f"{city_code}-{model_path}-{negative_points_str}-test",
-            tags=[city_code, negative_points_str],
-            config={
-                "model_path": model_path,
-                "mode": mode,
-                "city_code": city_code,
-                "negative_points": negative_points,
-                "using_negative_points": bool(negative_points)
-            }
+            name=f"{city_code}-{model_path}-{'with_neg' if negative_points else 'no_neg'}-test",
+            config={"model_path": model_path, "mode": mode, "city_code": city_code}
         )
-        wandb_images = []
-    elif mode == "full":
-        pass
-    else:
-        raise ValueError(f"Invalid mode: {mode}. Must be test or full.")
-
-    output_dir = f"/outputs/{model_path}"
-    geofile_dir = f"/outputs/{model_path}/geofiles" 
-    os.makedirs(output_dir, exist_ok=True)
-    os.makedirs(geofile_dir, exist_ok=True)
 
     shapefile_data = []
 
     for image in input_set:
         image_name = os.path.splitext(os.path.basename(image))[0]
         image_path = os.path.join("/inputs", image)
+        bbox = bounding_box_from_filename(image_name)
 
-        bounding_box_coords = bounding_box_from_filename(image_name)
-
-        original_image = Image.open(image_path).convert("RGB")
-        original_width, original_height = original_image.size
-
-        resized_image = original_image.resize((1024, 1024), Image.Resampling.LANCZOS)
-        resized_image = np.array(resized_image)
-
-        result = mask_generator.generate(resized_image)
-        detections = sv.Detections.from_sam(sam_result=result)
-
-        if detections.mask is None or len(detections.mask) == 0:
-            print(f"No detections generated for image: {image_name}. Skipping.")
-            continue
+        with Image.open(image_path) as img:
+            original_size = img.size
+            resized_img = np.array(img.resize((IMAGE_SIZE, IMAGE_SIZE)))
         
-        mask_annotator = sv.MaskAnnotator(color_lookup = sv.ColorLookup.INDEX)
-        annotated_image = resized_image.copy()
-        annotated_image = mask_annotator.annotate(annotated_image, detections=detections)
+        if len(resized_img.shape) == 3 and resized_img.shape[2] == 3:
+            resized_img_rgb = bgr_to_rgb(resized_img)
+        else:
+            resized_img_rgb = resized_img
 
-        annotated_image_path = os.path.join(output_dir, f"{image_name}_masked.jpg")
-        annotated_image_bgr = cv2.cvtColor(annotated_image, cv2.COLOR_RGB2BGR)
-        cv2.imwrite(annotated_image_path, annotated_image_bgr)
+        masks = mask_generator.generate(resized_img)
+        if negative_points:
+            filtered_masks = []
+            for mask in masks:
+                mask_intersects_buffer = False
+                segmentation = mask["segmentation"]
+                
+                for x, y in negative_points:
+                    if 0 <= x < IMAGE_SIZE and 0 <= y < IMAGE_SIZE:
+                        # Create circular buffer around negative point
+                        y_indices, x_indices = np.ogrid[:IMAGE_SIZE, :IMAGE_SIZE]
+                        distances = np.sqrt((x_indices - x)**2 + (y_indices - y)**2)
+                        buffer_mask = distances <= buffer_size
+                        
+                        # Check if mask intersects with buffer
+                        if np.any(segmentation & buffer_mask):
+                            mask_intersects_buffer = True
+                            break
+                
+                if not mask_intersects_buffer:
+                    filtered_masks.append(mask)
+            
+            masks = filtered_masks
+        
+        detections = sv.Detections.from_sam(masks)
+        
+        # Mask annotation
+        mask_annotator = sv.MaskAnnotator(color_lookup=sv.ColorLookup.INDEX)
+        annotated = mask_annotator.annotate(resized_img, detections)
+        if negative_points:
+            annotated = draw_negative_buffers(annotated, negative_points, buffer_size)
+        output_path = os.path.join(output_dir, f"{image_name}_masked.jpg")
+        cv2.imwrite(output_path, rgb_to_bgr(annotated))
 
         if mode == "test":
-            wandb_images.append(
+            collected_images.append(
                 wandb.Image(
-                    annotated_image,
-                    caption=f"Masked image: {image_name}"
+                    annotated,
+                    caption=f"Processed image: {image_name}"
                 )
             )
 
-
-        final_mask = np.zeros((original_height, original_width), dtype=np.uint8)
+        final_mask = np.zeros(original_size[::-1], dtype=np.uint8)
         for mask in detections.mask:
-            mask_resized = cv2.resize((mask>0).astype(np.uint8), 
-                                    (original_width, original_height), 
-                                    interpolation=cv2.INTER_NEAREST)
-            final_mask = cv2.bitwise_or(final_mask, mask_resized)
-
-        contours, _ = cv2.findContours(final_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        # Filter and validate polygons
-        valid_polygons = []
-        invalid_polygons = []
-            
-        for contour in contours: 
-            if len(contour) >= 3:
-                geo_points = []
-                for point in contour.squeeze(1):
-                    # Convert relative to geographic coordinates
-                    rel_x = point[0] / original_width
-                    rel_y = point[1] / original_height
-                    
-                    # Calculate geographic coordinates
-                    lon = rel_x * (bounding_box_coords[0] - bounding_box_coords[2]) + bounding_box_coords[2]
-                    lat = rel_y * (bounding_box_coords[1] - bounding_box_coords[3]) + bounding_box_coords[3]
-                    
-                    geo_points.append((lon, lat))
-            
-                polygon = Polygon(geo_points)
-                if polygon.is_valid:
-                    valid_polygons.append(polygon)
-                else:
-                    invalid_polygons.append(polygon)
-
-        if valid_polygons:
-            try:
-                mask_union = unary_union(valid_polygons)
-            except Exception as e:
-                print(f"Error during union of valid polygons: {e}")
-                mask_union = None
-        else:
-            mask_union = None
+            resized_mask = cv2.resize(mask.astype(np.uint8), original_size, interpolation=cv2.INTER_LINEAR)
+            np.putmask(final_mask, resized_mask > 0.5, 1)
         
-        final_union = mask_union  # Start with the unioned result
-        if invalid_polygons:
-            for poly in invalid_polygons:
-                try:
-                    # Merge invalid polygons one by one (unioning individually to avoid failure)
-                    if final_union:
-                        final_union = final_union.union(poly)
-                    else:
-                        final_union = poly
-                except Exception as e:
-                    print(f"Skipping invalid geometry due to error: {e}")
+        contours, _ = cv2.findContours(final_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        valid_polys = process_geometry(contours, original_size, bbox)
+        
+        if valid_polys:
+            union = unary_union(valid_polys)
+            bbox_poly = box(bbox[2], bbox[1], bbox[0], bbox[3])
+            shapefile_data.append({
+                "image_name": image_name,
+                "geometry": bbox_poly.difference(union)
+            })
 
-        bounding_box_polygon = box(
-        bounding_box_coords[2],  # min longitude (west)
-        bounding_box_coords[1],  # min latitude (south)
-        bounding_box_coords[0],  # max longitude (east)
-        bounding_box_coords[3],  # max latitude (north)
-        )
-        if not final_union.is_valid:
-            print("Final union has invalid geometries, cleaning for difference operation...")
-            final_union = make_valid(final_union)
-        inverted_selection = bounding_box_polygon.difference(final_union)
-    
-        if isinstance(inverted_selection, MultiPolygon):
-            largest_polygon = max(inverted_selection.geoms, key=lambda p: p.area)  # Find the largest polygon
-        else:
-            largest_polygon = inverted_selection
-
-        shapefile_data.append({"image_name": image_name, "geometry": largest_polygon})
-
-    # After all masks are processed, create the GeoDataFrame
-    gdf = gpd.GeoDataFrame(shapefile_data, crs="EPSG:4326")
-
-    # Export to GeoJSON
-    geojson_path = f"{geofile_dir}/cross_walks.geojson"
-    gdf.to_file(geojson_path, driver="GeoJSON")
-
-    # Export to KML
-    kml_path = f"{geofile_dir}/cross_walks.kml"
-    gdf.to_file(kml_path, driver="KML")
-
-    # Export to Shapefile
-    shapefile_path = f"{geofile_dir}/cross_walks.shp"
-    gdf.to_file(shapefile_path, driver="ESRI Shapefile")
+    # Data export
+    if shapefile_data:
+        gdf = gpd.GeoDataFrame(shapefile_data, geometry="geometry", crs="EPSG:4326")
+        export_geodata(gdf, f"/outputs/{model_path}/geofiles")
 
     if mode == "test":
         wandb.log({
-            "evaluation_samples": wandb_images  # Log all images in one go
+            "processed_images": collected_images
         })
         wandb.finish()
                 
 @app.local_entrypoint()
-def main(model: str, mode: str, negative_points: str = None):
+def mmain(model: str, mode: str, negative_points: str = None, buffer_size: int = 20):
     city_code = os.environ.get("MODAL_ENVIRONMENT")
-    if not city_code:
-        raise ValueError("MODAL_ENVIRONMENT environment variable must be set")
-
-    neg_points = None
-    if negative_points:
-        neg_points = json.loads(negative_points)
-
-    run_inference.remote(model_path=model, mode=mode, city_code=city_code, negative_points=neg_points)
+    run_inference.remote(
+        model_path=model,
+        mode=mode,
+        city_code=city_code,
+        negative_points=json.loads(negative_points) if negative_points else None,
+        buffer_size=buffer_size
+    )

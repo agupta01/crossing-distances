@@ -1,5 +1,10 @@
 import modal
 
+from inference.osm_utils import (
+    combine_similar_crosswalks,
+    create_perpendicular_lines,
+    map_nodes_to_closest_edges,
+)
 from inference.utils import RADIUS, app, osmnx_image
 
 scratch_volume = modal.Volume.from_name("scratch", create_if_missing=True)
@@ -12,7 +17,7 @@ def osm_ingest(place: str):
     import pandas as pd
 
     # Set useful tags for walking network
-    useful_tags = ox.settings.useful_tags_way + [
+    ox.settings.useful_tags_way = ox.settings.useful_tags_way + [
         "crossing",
         "crossing:uncontrolled",
         "crossing:zebra",
@@ -32,11 +37,13 @@ def osm_ingest(place: str):
         "pedestrian_crossing",
     ]
 
+    ox.settings.use_cache = True
+    ox.settings.log_console = True
+
     highway_subtypes = [
         "primary",
         "primary_link",
         "unclassified",
-        "motorway",
         "residential",
         "secondary",
         "secondary_link",
@@ -50,7 +57,10 @@ def osm_ingest(place: str):
         "corridor",
     ]
 
-    ox.config(use_cache=True, log_console=True, useful_tags_way=useful_tags)
+    service_exclusion = [
+        "parking_aisle",
+        "driveway",
+    ]
 
     # Download the network with specified tags
     G = ox.graph_from_place(
@@ -104,7 +114,7 @@ def osm_ingest(place: str):
     G_drive = ox.graph_from_place(
         query=place,
         network_type="drive",
-        custom_filter=f'["highway"~"{"|".join(highway_subtypes)}"]',
+        custom_filter=f'["highway"~"{"|".join(highway_subtypes)}"]["service"!~"{"|".join(service_exclusion)}"]["access"!~"private"]["aeroway"!~".*"]["indoor"!~"yes"]',
     )
     G_drive = ox.project_graph(G_drive)
     all_intersections = ox.consolidate_intersections(
@@ -113,16 +123,35 @@ def osm_ingest(place: str):
 
     # Save the intersection coordinates
     all_intersections.to_crs("EPSG:4326").get_coordinates().to_csv(
-        "/scratch/raw_intersection_coordinates.csv"
+        "/scratch/raw_intersection_coordinates_v2_0.csv"
     )
+
+    crosswalk_features_gdf = ox.features_from_place(
+        query=place,
+        tags={"highway": "crossing", "crossing": True, "disused": False},
+    )
+
+    crosswalk_nodes_gdf = crosswalk_features_gdf.query(
+        "element_type == 'node'"
+    ).droplevel("element_type")
 
     # Filter intersections to only those with pedestrian crossings within 15m
     # of the intersection. This is done using a spatial join between the nodes GDF from intersections and the edges GDF from G
-    crosswalk_nodes_gdf, crosswalk_edges_gdf = ox.graph_to_gdfs(
-        G, nodes=True, edges=True
+    crosswalk_edges_gdf = pd.concat(
+        [
+            ox.graph_to_gdfs(G, nodes=False, edges=True),
+            crosswalk_features_gdf.query("element_type == 'way'").droplevel(
+                "element_type"
+            ),
+        ]
     )
-    crosswalk_nodes_gdf = crosswalk_nodes_gdf.to_crs("EPSG:3857")
     crosswalk_edges_gdf = crosswalk_edges_gdf.to_crs("EPSG:3857")
+    crosswalk_nodes_gdf = crosswalk_nodes_gdf.to_crs("EPSG:3857")
+    crosswalk_nodes_gdf = crosswalk_nodes_gdf.loc[
+        ~crosswalk_nodes_gdf.geometry.within(
+            crosswalk_edges_gdf.buffer(2.5).unary_union
+        )
+    ]
     crosswalk_edges_and_nodes_gdf = pd.concat(
         [
             crosswalk_edges_gdf.reset_index()[["osmid", "geometry"]],
@@ -133,9 +162,55 @@ def osm_ingest(place: str):
     crosswalk_edges_gdf.drop_duplicates("osmid", inplace=True)
     crosswalk_edges_and_nodes_gdf.drop_duplicates("osmid", inplace=True)
 
+    drive_edges = ox.graph_to_gdfs(G_drive, nodes=False, edges=True)
+    drive_edges = (
+        drive_edges.reset_index().set_index(
+            drive_edges.index.to_frame().apply(
+                lambda x: f"{x['u']}-{x['v']}-{x['key']}", axis=1
+            )
+        )
+        # .drop_duplicates("osmid")
+    )
+
+    # Map crosswalk nodes (for crosswalks that don't already have an edge)
+    # to driving roads
+    mapping = map_nodes_to_closest_edges(crosswalk_nodes_gdf, drive_edges)
+
+    # Build perpendicular crosswalks for each node
+    artificial_crossings = create_perpendicular_lines(
+        nodes=crosswalk_nodes_gdf.to_crs("EPSG:3857"),
+        edges=drive_edges.to_crs("EPSG:3857"),
+        mapping=mapping,
+    ).to_crs(epsg=4326)
+
+    # Combine crosswalks that are actually the same,
+    # just on different sides of the road
+    # (for example, for roads separated by a median strip)
+    merged_crosswalks = combine_similar_crosswalks(
+        gdf=artificial_crossings.assign(
+            drive_edge_mapping=list(
+                map(lambda x: mapping[x], artificial_crossings.index)
+            )
+        ),
+        heading_tol=5,
+        buffer=3,
+        magnify=3,
+    )
+
+    # Append merged crosswalks to existing crosswalks
+    all_crosswalk_edges = pd.concat(
+        [
+            merged_crosswalks[["original_line"]]
+            .reset_index()
+            .rename(columns={"original_line": "geometry", "combined_id": "osmid"})
+            .set_geometry("geometry", crs="EPSG:4326")
+            .to_crs("EPSG:3857"),
+            crosswalk_edges_gdf[["osmid", "geometry"]],
+        ]
+    )
+
     # Save crosswalk edges
-    # TODO: save the crosswalk_edges_and_nodes_gdf instead once we can grow nodes into edges (shp files can't take mixed geometries)
-    crosswalk_edges_gdf.to_file("/scratch/crosswalk_edges.shp", index=False)
+    all_crosswalk_edges.to_file("/scratch/crosswalk_edges_v2_0.shp", index=False)
 
     all_intersections_gdf = gpd.GeoDataFrame(
         all_intersections, columns=["geometry"], crs=all_intersections.crs
@@ -158,5 +233,5 @@ def osm_ingest(place: str):
     intersections_with_crosswalks["y"] = intersections_with_crosswalks.geometry.y
 
     intersections_with_crosswalks[["x", "y"]].to_csv(
-        "/scratch/intersection_coordinates.csv"
+        "/scratch/intersection_coordinates_v2_0.csv"
     )

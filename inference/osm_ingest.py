@@ -1,3 +1,7 @@
+import argparse
+import os
+import shutil
+
 import modal
 
 from inference.osm_utils import (
@@ -16,7 +20,6 @@ def osm_ingest(place: str):
 
 
 def osm_ingest_local(place: str, filepath: str):
-    import os
     import geopandas as gpd
     import osmnx as ox
     import pandas as pd
@@ -245,3 +248,29 @@ def osm_ingest_local(place: str, filepath: str):
     intersections_with_crosswalks[["x", "y"]].to_csv(
         os.path.join(filepath, "intersection_coordinates_v2_0.csv")
     )
+
+def run_local():
+    argparser = argparse.ArgumentParser()
+    argparser.add_argument("--place", type=str, required=True)
+    argparser.add_argument("--env", type=str, required=True)
+    args = argparser.parse_args()
+    filepath = f"./{args.env}_outputs"
+    # Check if the dir in filepath exists, if it does throw an error. If it doesn't create it.
+    if not os.path.exists(filepath):
+        os.makedirs(filepath)
+    else:
+        raise ValueError(f"Directory {filepath} already exists. Choose a different directory.")
+
+    osm_ingest_local(place=args.place, filepath=filepath)
+
+    # Upload the results to the scratch volume
+    scratch_volume = modal.Volume.from_name("scratch", environment_name=args.env)
+    with scratch_volume.batch_upload(force=True) as batch:
+        for filename in os.listdir(filepath):
+            batch.put_file(os.path.join(filepath, filename))
+
+    # Cleanup directory
+    shutil.rmtree(filepath)
+
+if __name__ == "__main__":
+    run_local()

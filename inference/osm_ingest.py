@@ -12,6 +12,11 @@ scratch_volume = modal.Volume.from_name("scratch", create_if_missing=True)
 
 @app.function(volumes={"/scratch": scratch_volume}, image=osmnx_image, timeout=7200, cpu=4)
 def osm_ingest(place: str):
+    osm_ingest_local(place, filepath="/scratch")
+
+
+def osm_ingest_local(place: str, filepath: str):
+    import os
     import geopandas as gpd
     import osmnx as ox
     import pandas as pd
@@ -126,7 +131,7 @@ def osm_ingest(place: str):
 
     # Save the intersection coordinates
     all_intersections.to_crs("EPSG:4326").get_coordinates().to_csv(
-        "/scratch/raw_intersection_coordinates_v2_0.csv"
+        os.path.join(filepath, "raw_intersection_coordinates_v2_0.csv")
     )
 
     crosswalk_features_gdf = ox.features_from_place(
@@ -215,7 +220,7 @@ def osm_ingest(place: str):
     )
 
     # Save crosswalk edges
-    all_crosswalk_edges.to_file("/scratch/crosswalk_edges_v2_0.shp", index=False)
+    all_crosswalk_edges.to_file(os.path.join(filepath, "crosswalk_edges_v2_0.shp"), index=False)
 
     all_intersections_gdf = gpd.GeoDataFrame(
         all_intersections, columns=["geometry"], crs=all_intersections.crs
@@ -238,5 +243,5 @@ def osm_ingest(place: str):
     intersections_with_crosswalks["y"] = intersections_with_crosswalks.geometry.y
 
     intersections_with_crosswalks[["x", "y"]].to_csv(
-        "/scratch/intersection_coordinates_v2_0.csv"
+        os.path.join(filepath, "intersection_coordinates_v2_0.csv")
     )

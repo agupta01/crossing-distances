@@ -261,16 +261,19 @@ def run_local():
     else:
         raise ValueError(f"Directory {filepath} already exists. Choose a different directory.")
 
-    osm_ingest_local(place=args.place, filepath=filepath)
-
-    # Upload the results to the scratch volume
-    scratch_volume = modal.Volume.from_name("scratch", environment_name=args.env)
-    with scratch_volume.batch_upload(force=True) as batch:
-        for filename in os.listdir(filepath):
-            batch.put_file(os.path.join(filepath, filename))
-
-    # Cleanup directory
-    shutil.rmtree(filepath)
+    try:
+        osm_ingest_local(place=args.place, filepath=filepath)
+    
+        # Upload the results to the scratch volume
+        scratch_volume = modal.Volume.from_name("scratch", environment_name=args.env)
+        with scratch_volume.batch_upload(force=True) as batch:
+            for filename in os.listdir(filepath):
+                batch.put_file(os.path.join(filepath, filename), remote_path=f"/{filename}")
+    except Exception as e:
+        print(f"Exception when running osm_ingest: {e}")
+    finally:
+        # Cleanup directory
+        shutil.rmtree(filepath)
 
 if __name__ == "__main__":
     run_local()

@@ -6,7 +6,8 @@ from io import BytesIO
 
 import modal
 
-app = modal.App("crossing-distances")
+APP_NAME = "crossing-distances"
+app = modal.App(APP_NAME)
 
 PRECISION = 6  # decimal points = 111mm resolution
 RADIUS = 25.0  # meters. Default size of an intersection

@@ -10,7 +10,7 @@ from inference.utils import RADIUS, app, osmnx_image
 scratch_volume = modal.Volume.from_name("scratch", create_if_missing=True)
 
 
-@app.function(volumes={"/scratch": scratch_volume}, image=osmnx_image, timeout=3600)
+@app.function(volumes={"/scratch": scratch_volume}, image=osmnx_image, timeout=7200, cpu=4)
 def osm_ingest(place: str):
     import geopandas as gpd
     import osmnx as ox
@@ -67,6 +67,8 @@ def osm_ingest(place: str):
         query=place, network_type="all", simplify=False, retain_all=True
     )
 
+    print("Queried all")
+
     # Identify and remove non-walk edges
     non_walk = []
     for u, v, k, d in G.edges(keys=True, data=True):
@@ -116,6 +118,7 @@ def osm_ingest(place: str):
         network_type="drive",
         custom_filter=f'["highway"~"{"|".join(highway_subtypes)}"]["service"!~"{"|".join(service_exclusion)}"]["access"!~"private"]["aeroway"!~".*"]["indoor"!~"yes"]',
     )
+    print("Queried drive network")
     G_drive = ox.project_graph(G_drive)
     all_intersections = ox.consolidate_intersections(
         G_drive, rebuild_graph=False, dead_ends=False
@@ -130,6 +133,8 @@ def osm_ingest(place: str):
         query=place,
         tags={"highway": "crossing", "crossing": True, "disused": False},
     )
+
+    print("Queried crosswalks")
 
     crosswalk_nodes_gdf = crosswalk_features_gdf.query(
         "element_type == 'node'"
@@ -149,7 +154,7 @@ def osm_ingest(place: str):
     crosswalk_nodes_gdf = crosswalk_nodes_gdf.to_crs("EPSG:3857")
     crosswalk_nodes_gdf = crosswalk_nodes_gdf.loc[
         ~crosswalk_nodes_gdf.geometry.within(
-            crosswalk_edges_gdf.buffer(2.5).unary_union
+            crosswalk_edges_gdf.buffer(5).unary_union
         )
     ]
     crosswalk_edges_and_nodes_gdf = pd.concat(

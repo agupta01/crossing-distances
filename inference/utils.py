@@ -6,7 +6,8 @@ from io import BytesIO
 
 import modal
 
-app = modal.App("crossing-distances")
+APP_NAME = "crossing-distances"
+app = modal.App(APP_NAME)
 
 PRECISION = 6  # decimal points = 111mm resolution
 RADIUS = 25.0  # meters. Default size of an intersection
@@ -17,9 +18,12 @@ trunc_explanation = (
     "Values must be truncated so that decoding returns the original value."
 )
 
-osmnx_image = modal.Image.from_registry("gboeing/osmnx:latest").env(
-    {"TINI_SUBREAPER": "1"}
+osmnx_image = (
+    modal.Image.from_registry("gboeing/osmnx:latest")
+    .pip_install("geopy")
+    .env({"TINI_SUBREAPER": "1"})
 )
+
 
 sam_image = (
     modal.Image.from_registry("gboeing/osmnx:latest")
@@ -41,7 +45,9 @@ redrive_dict = modal.Dict.from_name(
     f"crosswalk-data-{os.environ['MODAL_ENVIRONMENT']}-redrive", create_if_missing=True
 )
 
-main_scratch = modal.Volume.from_name("scratch", environment_name="main", create_if_missing=True)
+main_scratch = modal.Volume.from_name(
+    "scratch", environment_name="main", create_if_missing=True
+)
 
 
 def coords_from_distance(
@@ -163,20 +169,22 @@ def get_from_volume(
         data += chunk
     return BytesIO(data)
 
+
 def dist(a, b):
-    return math.sqrt((a[0] - b[0])**2 + (a[1] - b[1])**2)
+    return math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2)
 
 
-def filter_coordinates(df, city_code, sample, logger, return_length=False, return_df=False):
+def filter_coordinates(
+    df, city_code, sample, logger, return_length=False, return_df=False
+):
     # Sample the dataframe and round coordinates
     sampled_df = df.sample(n=sample if sample > 0 else len(df))
-    sampled_df['coords'] = sampled_df.apply(
-        lambda row: (round(row.y, PRECISION), round(row.x, PRECISION)),
-        axis=1
+    sampled_df["coords"] = sampled_df.apply(
+        lambda row: (round(row.y, PRECISION), round(row.x, PRECISION)), axis=1
     )
 
     # Generate filenames for each coordinate
-    sampled_df['filename'] = sampled_df['coords'].apply(
+    sampled_df["filename"] = sampled_df["coords"].apply(
         lambda coord: f"crosswalk_{get_crosswalk_id(coord[0], coord[1])}.jpeg"
     )
 
@@ -187,13 +195,15 @@ def filter_coordinates(df, city_code, sample, logger, return_length=False, retur
     )
 
     # Get existing files in volume
-    existing_files = set(entry.path.split('/')[-1] for entry in dataset_volume.iterdir("/"))
+    existing_files = set(
+        entry.path.split("/")[-1] for entry in dataset_volume.iterdir("/")
+    )
 
     # Filter out coordinates whose files already exist
-    filtered_df = sampled_df[~sampled_df['filename'].isin(existing_files)]
+    filtered_df = sampled_df[~sampled_df["filename"].isin(existing_files)]
 
     # Get the final set of coordinates
-    filtered_coords = set(filtered_df['coords'].tolist())
+    filtered_coords = set(filtered_df["coords"].tolist())
 
     logger.info(
         f"Found {len(sampled_df) - len(filtered_coords)}, need {len(filtered_coords)} coordinates"

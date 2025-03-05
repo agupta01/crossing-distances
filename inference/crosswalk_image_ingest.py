@@ -1,5 +1,5 @@
-import os
 import json
+import os
 from logging import Logger
 
 import modal
@@ -24,7 +24,7 @@ from inference.utils import (
     image=committer_image,
     volumes={"/data": dataset_volume},
     timeout=3600,
-    concurrency_limit=10, # need to leave container quota open for the get_image_for_crosswalk function
+    concurrency_limit=10,  # need to leave container quota open for the get_image_for_crosswalk function
 )
 def get_crosswalks_batch(
     lat_batch: tuple[float, ...], long_batch: tuple[float, ...], logger: Logger
@@ -32,7 +32,9 @@ def get_crosswalks_batch(
     try:
         logger.info(f"Batch contains {len(lat_batch)} coordinates.")
         ids_and_raw_images = list(
-            get_image_for_crosswalk.map(lat_batch, long_batch, return_exceptions=True, order_outputs=True)
+            get_image_for_crosswalk.map(
+                lat_batch, long_batch, return_exceptions=True, order_outputs=True
+            )
         )
         logger.info("Images pulled. Starting save task...")
         saved_files = commit_images_to_volume(ids_and_raw_images, logger)
@@ -48,14 +50,21 @@ def get_crosswalks_batch(
                 f"{modal.current_input_id()}_{modal.current_function_call_id()}_{i}"
             ] = (lat, long, e)
 
-def create_decoder(saved_files: list[str], lat_batch: tuple[float, ...], long_batch: tuple[float, ...]):
+
+def create_decoder(
+    saved_files: list[str], lat_batch: tuple[float, ...], long_batch: tuple[float, ...]
+):
     """Saves a decoder file to map coordinates to volume filenames. Assumes the saved_files are in order."""
     decoder_filename = f"/data/decoder_{modal.current_function_call_id()}.json"
-    decoder = {f"{lat},{long}": saved_files[i] for i, (lat, long) in enumerate(zip(lat_batch, long_batch))}
+    decoder = {
+        f"{lat},{long}": saved_files[i]
+        for i, (lat, long) in enumerate(zip(lat_batch, long_batch))
+    }
     with open(decoder_filename, "x") as f:
         json.dump(decoder, f)
 
     dataset_volume.commit()
+
 
 @app.function(image=committer_image, volumes={"/data": dataset_volume}, timeout=86400)
 def task_dispatcher(
@@ -178,12 +187,23 @@ def main(city_code: str | None = None, sample: int = 1000, batch_size: int = 100
         f"[MAP BEGIN] Split into {num_batches} batches containing {batch_size} coordinates each."
     )
 
-    map_results = list(get_crosswalks_batch.map(lats_batcher, longs_batcher, kwargs={"logger": logger}, return_exceptions=True))
+    map_results = list(
+        get_crosswalks_batch.map(
+            lats_batcher,
+            longs_batcher,
+            kwargs={"logger": logger},
+            return_exceptions=True,
+        )
+    )
 
     # Log out the number of batches that succeeded and the number that failed
-    logger.info(f"[MAP END] Successfully processed {len([r for r in map_results if not isinstance(r, Exception)])} batches.")
+    logger.info(
+        f"[MAP END] Successfully processed {len([r for r in map_results if not isinstance(r, Exception)])} batches."
+    )
     if any(isinstance(r, Exception) for r in map_results):
-        logger.warning(f"[MAP END] Failed to process {len([r for r in map_results if isinstance(r, Exception)])} batches.")
+        logger.warning(
+            f"[MAP END] Failed to process {len([r for r in map_results if isinstance(r, Exception)])} batches."
+        )
 
 
 @app.local_entrypoint()

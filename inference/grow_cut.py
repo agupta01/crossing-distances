@@ -142,7 +142,6 @@ def grow_cut():
         refined_crosswalks.geojson: GeoJSON file containing the refined crosswalks
     """
     import time
-    from itertools import chain
 
     import geopandas as gpd
 

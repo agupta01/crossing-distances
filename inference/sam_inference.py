@@ -1,47 +1,62 @@
 import os
-from dotenv import load_dotenv
-import numpy as np
-import cv2 
+
+# Standard library imports
+import csv
+import gc
+import json
+import math
+import pickle
+import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Thread
+
+# Third-party imports
+import cv2
 import geopandas as gpd
+import modal
+import numpy as np
 import osmnx as ox
+import psutil
+import scipy.interpolate
+import supervision as sv
+import torch
+import wandb
+from dotenv import load_dotenv
 from shapely.geometry import LineString, Polygon, box, MultiPolygon
 from shapely.ops import unary_union
-import torch
-import supervision as sv
+from shapely.validation import make_valid, explain_validity
+
+load_dotenv()
+
+# Project imports
 from sam2.build_sam import build_sam2
 from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
-from threading import Thread
-import pickle
-import csv
-import json
-from shapely.validation import make_valid, explain_validity
-import scipy.interpolate
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import gc
-import psutil
-import math
-import random
-import wandb
-
-import modal
-
-# Import utilities from utils.py
 from utils import (
     PRECISION, 
     get_crosswalk_id, 
     decode_crosswalk_id, 
-    coords_from_distance, 
+    fuzzy_search_optimized,
     bounding_box_from_filename
 )
 
-load_dotenv()
+
 
 # Configuration constants
-IMAGE_SIZE = 1024
+# ===================================================================================================
+# Environment setup
+ENV_NAME = os.environ.get('MODAL_ENVIRONMENT', 'local')
 CITY_CODE = os.getenv("CITY_CODE")
-INPUTS_VOLUME_NAME = f"crosswalk-data-{CITY_CODE}"
+
+# Volume naming
+INPUTS_VOLUME_NAME = f"crosswalk-data-{ENV_NAME}"
 OUTPUTS_VOLUME_NAME = f"{INPUTS_VOLUME_NAME}-results"
+
+# File paths
 CITY_CODE_MAPPING_CSV_PATH = "data/city_code_mapping.csv"
+
+# Image processing
+IMAGE_SIZE = 1024
+CV2_STRUCTURING_ELEMENT = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
 
 # SAM2 model configuration
 MASK_GENERATOR_CONFIG = {
@@ -63,9 +78,8 @@ MAX_ABSOLUTE_OVERLAP = 10.0  # meters²
 MIN_CROSSWALK_AREA = 5.0     # meters²
 OSM_BUFFER_METERS = 1.5
 
-# Pre-compute common constants
-CV2_STRUCTURING_ELEMENT = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
-
+# Modal setup
+# ===================================================================================================
 # Setup Modal app
 app = modal.App(name="crossing-distance-sam2-inference")
 
@@ -128,14 +142,18 @@ infer_image = (
 
 # Setup Modal volumes
 weights_volume = modal.Volume.from_name("sam2-weights", create_if_missing=True, environment_name="sam_test")
-inputs_volume = modal.Volume.from_name(INPUTS_VOLUME_NAME, environment_name=CITY_CODE)
-scratch_volume = modal.Volume.from_name("scratch", environment_name=CITY_CODE)
-outputs_volume = modal.Volume.from_name(OUTPUTS_VOLUME_NAME, create_if_missing=True, environment_name=CITY_CODE)
+inputs_volume = modal.Volume.from_name(INPUTS_VOLUME_NAME, environment_name=ENV_NAME)
+scratch_volume = modal.Volume.from_name("scratch", environment_name=ENV_NAME)
+outputs_volume = modal.Volume.from_name(OUTPUTS_VOLUME_NAME, create_if_missing=True, environment_name=ENV_NAME)
 
 # Initialize thread pool for I/O operations
 io_executor = ThreadPoolExecutor(max_workers=16)
 
+# Utility Functions
+# ===================================================================================================
+
 # I/O utilities
+# ---------------------------------------------------------------------------------------------------
 def async_write(path, image):
     """Non-blocking image write using thread pool executor"""
     return io_executor.submit(cv2.imwrite, path, image)
@@ -163,6 +181,8 @@ def gc_collect():
     print(f"GPU memory: {torch.cuda.memory_allocated() / (1024 * 1024):.2f} MB allocated, "
           f"{torch.cuda.memory_reserved() / (1024 * 1024):.2f} MB reserved")
 
+# Image processing utilities
+# ---------------------------------------------------------------------------------------------------
 def bgr_to_rgb(image):
     """Ensure consistent color conversion from BGR to RGB"""
     if len(image.shape) == 3 and image.shape[2] == 3:
@@ -176,6 +196,7 @@ def rgb_to_bgr(image):
     return image
 
 # Geographic utilities
+# ---------------------------------------------------------------------------------------------------
 def get_utm_zone(longitude):
     """Get the UTM zone for a given longitude"""
     return int((longitude + 180) // 6) + 1
@@ -187,7 +208,9 @@ def get_utm_projection(lon, lat):
     epsg_code = 32600 + utm_zone if northern else 32700 + utm_zone
     return f"EPSG:{epsg_code}"
 
-# Data loading functions
+# Data Processing Classes
+# ===================================================================================================
+
 class DataLoader:
     """Class to handle data loading and preparation operations"""
     
@@ -195,32 +218,54 @@ class DataLoader:
     def load_and_filter_images(csv_path: str, image_dir: str) -> list:
         """
         Combined function that loads coordinates from CSV and finds matching images.
+        Includes caching for fuzzy search results to improve performance.
         Returns a list of valid image paths and tracks original coordinates for missing images.
         """
+        # Check if cache file exists
+        cache_dir = "/outputs/search_cache"
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_file = os.path.join(cache_dir, f"fuzzy_search_cache.pkl")
+        
+        # Get stats for current data to detect changes
+        csv_mtime = os.path.getmtime(csv_path)
+        with open(csv_path, 'r') as f:
+            csv_line_count = sum(1 for _ in f)
+        
+        image_files = [f for f in os.listdir(image_dir) if f.endswith(('.jpg', '.jpeg', '.png'))]
+        image_count = len(image_files)
+        
+        # Create a unique hash for the current data state
+        data_state_hash = f"{csv_path}_{csv_mtime}_{csv_line_count}_{image_dir}_{image_count}"
+        
+        # Check if cache exists and is valid
+        cache_valid = False
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file, 'rb') as f:
+                    cache = pickle.load(f)
+                    if cache.get('data_state_hash') == data_state_hash:
+                        print("Using cached fuzzy search results")
+                        cache_valid = True
+                        valid_images = cache.get('valid_images', [])
+                        return valid_images
+                    else:
+                        print("Cache exists but data has changed - rebuilding")
+            except Exception as e:
+                print(f"Error loading cache: {e}")
+                # Continue with normal processing if cache loading fails
+        
+        # If cache is invalid or doesn't exist, proceed with normal processing
         valid_images = []
         coordinate_to_id = {}
         missing_coordinates = []
         
-        # First, find and load the decoder JSON file
-        decoder_file = None
-        for file in os.listdir(image_dir):
-            if file.endswith('.json'):
-                decoder_file = os.path.join(image_dir, file)
-                print(f"Found decoder file: {decoder_file}")
-                break
-        
-        # Load the decoder JSON if found
-        decoder = {}
-        if decoder_file:
-            try:
-                with open(decoder_file, 'r') as f:
-                    decoder = json.load(f)
-                print(f"Loaded decoder with {len(decoder)} entries")
-            except Exception as e:
-                print(f"Error loading decoder file: {e}")
+        # Add counters to track match types
+        exact_match_count = 0
+        fuzzy_match_count = 0
         
         # Index all images by ID for faster lookup
         image_id_map = {}
+        all_crosswalk_ids = []  # Store all IDs for fuzzy matching later
         for filename in os.listdir(image_dir):
             if filename.endswith('.json'):
                 continue
@@ -231,16 +276,7 @@ class DataLoader:
             if len(parts) == 2 and parts[0] == "crosswalk":
                 crosswalk_id = parts[1]
                 image_id_map[crosswalk_id] = os.path.join(image_dir, filename)
-        
-        # Pre-process decoder keys for proximity matching
-        if decoder:
-            decoder_coords = []
-            for coord_key in decoder.keys():
-                try:
-                    lat, lon = map(float, coord_key.split(','))
-                    decoder_coords.append((lat, lon, coord_key))
-                except Exception:
-                    continue
+                all_crosswalk_ids.append(crosswalk_id)  # Add to list for fuzzy matching
         
         # Process coordinates from CSV
         with open(csv_path, 'r') as file:
@@ -250,46 +286,47 @@ class DataLoader:
                 latitude = float(row['y'])
                 orig_coords = (latitude, longitude)
                 
-                # First try direct lookup in decoder using original coordinates
-                coord_key = f"{latitude},{longitude}"
-                found_via_decoder = False
+                # Round to PRECISION to match filename encoding
+                rounded_lat = round(latitude, PRECISION)
+                rounded_lon = round(longitude, PRECISION)
                 
-                if decoder:
-                    # Exact match check
-                    if coord_key in decoder:
-                        # Found direct match in decoder
-                        img_path = decoder[coord_key].replace("/data/", "")
-                        full_path = os.path.join(image_dir, img_path)
-                        if os.path.exists(full_path):
-                            valid_images.append(full_path)
-                            found_via_decoder = True
+                try:
+                    # Generate crosswalk ID
+                    crosswalk_id = get_crosswalk_id(rounded_lat, rounded_lon)
+                    coordinate_to_id[orig_coords] = crosswalk_id
                     
-                    # If not found with exact match, try proximity match (within ~1 meter)
-                    if not found_via_decoder:
-                        # Convert ~1 meter to decimal degrees (approximate, varies by latitude)
-                        # At equator, 1 meter ≈ 0.000009 degrees
-                        tolerance = 0.000009  # ~1 meter at equator
+                    # Check if image exists with this ID
+                    if crosswalk_id in image_id_map:
+                        valid_images.append(image_id_map[crosswalk_id])
+                        exact_match_count += 1  # Direct ID match
+                    else:
+                        # Try alternative formats
+                        expected_filename = f"crosswalk_{crosswalk_id}"
+                        found = False
                         
-                        # Adjust tolerance for latitude (1 meter gets smaller in longitude as we move toward poles)
-                        # cos(latitude) adjustment accounts for longitude compression at higher latitudes
-                        lon_tolerance = tolerance / math.cos(math.radians(abs(latitude)))
+                        for filename in os.listdir(image_dir):
+                            if filename.endswith(('.jpeg', '.jpg', '.png')) and expected_filename in filename:
+                                valid_images.append(os.path.join(image_dir, filename))
+                                found = True
+                                exact_match_count += 1  # Alternative format match is still exact
+                                break
                         
-                        closest_match = None
-                        min_distance = float('inf')
-                        
-                        for dc_lat, dc_lon, dc_key in decoder_coords:
-                            # Calculate approximate distance in degrees
-                            lat_diff = abs(latitude - dc_lat)
-                            lon_diff = abs(longitude - dc_lon)
+                        # If exact match not found, try fuzzy matching
+                        if not found and all_crosswalk_ids:
+                            # Use fuzzy matching to find the closest crosswalk ID
+                            closest_id = fuzzy_search_optimized(crosswalk_id, all_crosswalk_ids)
                             
-                            # Quick filter to avoid expensive calculations
-                            if lat_diff > tolerance or lon_diff > lon_tolerance:
-                                continue
-                                
-                            # Haversine for more precise distance on curved earth surface
-                            # Convert lat/lon from degrees to radians
-                            lat1, lon1 = math.radians(latitude), math.radians(longitude)
-                            lat2, lon2 = math.radians(dc_lat), math.radians(dc_lon)
+                            # Calculate character-level matching error (number of mismatched characters)
+                            char_errors = sum(1 for a, b in zip(crosswalk_id, closest_id) if a != b)
+                            error_pct = char_errors / len(crosswalk_id)
+                            
+                            # Decode the coordinates from both IDs to calculate geographic distance
+                            orig_coords_latlon = decode_crosswalk_id(crosswalk_id)
+                            fuzzy_coords_latlon = decode_crosswalk_id(closest_id)
+                            
+                            # Calculate Haversine distance between the coordinates
+                            lat1, lon1 = math.radians(orig_coords_latlon.lat), math.radians(orig_coords_latlon.long)
+                            lat2, lon2 = math.radians(fuzzy_coords_latlon.lat), math.radians(fuzzy_coords_latlon.long)
                             
                             # Haversine formula
                             dlon = lon2 - lon1
@@ -299,54 +336,38 @@ class DataLoader:
                             
                             # Earth radius in meters
                             r = 6371000
-                            distance = c * r  # Distance in meters
+                            ground_distance = c * r  # Distance in meters
                             
-                            if distance < min_distance and distance <= 1.0:  # 1.0 meter threshold
-                                min_distance = distance
-                                closest_match = dc_key
+                            # Only use match if ground distance is less than 1 meter
+                            if ground_distance <= 1.0:
+                                # Get the path to the image with this ID
+                                matched_img_path = image_id_map[closest_id]
+                                valid_images.append(matched_img_path)
+                                found = True
+                                fuzzy_match_count += 1  # Count successful fuzzy matches
+                                
+                                print(f"Found fuzzy match for {crosswalk_id}:")
+                                print(f"  Matched ID: {closest_id}")
+                                print(f"  Character errors: {char_errors}/{len(crosswalk_id)} ({error_pct:.2%})")
+                                print(f"  Ground distance: {ground_distance:.2f}m")
+                            else:
+                                print(f"Rejected fuzzy match (distance > 1m):")
+                                print(f"  Original ID: {crosswalk_id}")
+                                print(f"  Matched ID: {closest_id}")
+                                print(f"  Ground distance: {ground_distance:.2f}m")
                         
-                        if closest_match is not None:
-                            img_path = decoder[closest_match].replace("/data/", "")
-                            full_path = os.path.join(image_dir, img_path)
-                            if os.path.exists(full_path):
-                                valid_images.append(full_path)
-                                found_via_decoder = True
-                                print(f"Found proximity match ({min_distance:.2f}m) for {latitude},{longitude} -> {closest_match}")
-                
-                # If not found via decoder, try rounded coordinates and ID matching
-                if not found_via_decoder:
-                    # Round to PRECISION to match filename encoding
-                    rounded_lat = round(latitude, PRECISION)
-                    rounded_lon = round(longitude, PRECISION)
-                    
-                    try:
-                        # Generate crosswalk ID
-                        crosswalk_id = get_crosswalk_id(rounded_lat, rounded_lon)
-                        coordinate_to_id[orig_coords] = crosswalk_id
-                        
-                        # Check if image exists with this ID
-                        if crosswalk_id in image_id_map:
-                            valid_images.append(image_id_map[crosswalk_id])
-                        else:
-                            # Try alternative formats
-                            expected_filename = f"crosswalk_{crosswalk_id}"
-                            found = False
-                            
-                            for filename in os.listdir(image_dir):
-                                if filename.endswith(('.jpeg', '.jpg', '.png')) and expected_filename in filename:
-                                    valid_images.append(os.path.join(image_dir, filename))
-                                    found = True
-                                    break
-                            
-                            if not found:
-                                missing_coordinates.append((orig_coords, crosswalk_id))
-                    except AssertionError as e:
-                        print(f"Skipping invalid coordinate ({rounded_lat}, {rounded_lon}): {e}")
-                        missing_coordinates.append((orig_coords, None))
+                        if not found:
+                            missing_coordinates.append((orig_coords, crosswalk_id))
+                except AssertionError as e:
+                    print(f"Skipping invalid coordinate ({rounded_lat}, {rounded_lon}): {e}")
+                    missing_coordinates.append((orig_coords, None))
         
         # Print detailed statistics
         print(f"Processed {len(coordinate_to_id)} valid coordinates from CSV")
         print(f"Found {len(valid_images)} matching images")
+        print(f"  - Exact matches: {exact_match_count} ({exact_match_count / len(valid_images) * 100:.1f}% of total)")
+        print(f"  - Fuzzy matches: {fuzzy_match_count} ({fuzzy_match_count / len(valid_images) * 100:.1f}% of total)")
+        print(f"  - Fuzzy matching added {fuzzy_match_count} images ({fuzzy_match_count / (exact_match_count or 1) * 100:.1f}% increase)")
         print(f"Missing {len(missing_coordinates)} coordinates")
         
         # Output details of missing coordinates
@@ -365,14 +386,71 @@ class DataLoader:
             # Save all missing coordinates to file
             missing_file = os.path.join(image_dir, "missing_coordinates.csv")
             with open(missing_file, 'w') as f:
-                f.write("Latitude,Longitude,CrosswalkID,ExpectedFilename\n")
+                f.write("Latitude,Longitude,CrosswalkID,ExpectedFilename,ClosestMatch,ErrorChars,GroundDistanceM\n")
                 for coords, crosswalk_id in missing_coordinates:
                     lat, lon = coords
                     if crosswalk_id:
-                        f.write(f"{lat},{lon},{crosswalk_id},crosswalk_{crosswalk_id}.jpg\n")
+                        # Try to find closest match for reporting purposes
+                        closest_match = ""
+                        error_chars = ""
+                        ground_distance = ""
+                        
+                        if all_crosswalk_ids:
+                            closest_id = fuzzy_search_optimized(crosswalk_id, all_crosswalk_ids)
+                            error_chars = sum(1 for a, b in zip(crosswalk_id, closest_id) if a != b)
+                            
+                            # Calculate ground distance
+                            orig_coords_latlon = decode_crosswalk_id(crosswalk_id)
+                            fuzzy_coords_latlon = decode_crosswalk_id(closest_id)
+                            
+                            lat1, lon1 = math.radians(orig_coords_latlon.lat), math.radians(orig_coords_latlon.long)
+                            lat2, lon2 = math.radians(fuzzy_coords_latlon.lat), math.radians(fuzzy_coords_latlon.long)
+                            
+                            dlon = lon2 - lon1
+                            dlat = lat2 - lat1
+                            a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
+                            c = 2 * math.asin(math.sqrt(a))
+                            
+                            r = 6371000
+                            ground_distance = c * r
+                            
+                            closest_match = closest_id
+                        
+                        f.write(f"{lat},{lon},{crosswalk_id},crosswalk_{crosswalk_id}.jpg,{closest_match},{error_chars},{ground_distance}\n")
                     else:
-                        f.write(f"{lat},{lon},N/A,N/A\n")
+                        f.write(f"{lat},{lon},N/A,N/A,,,\n")
             print(f"\nSaved all {len(missing_coordinates)} missing coordinates to {missing_file}")
+        
+        # Add a summary of match statistics to the missing coordinates file
+        if os.path.exists(missing_file):
+            with open(missing_file, 'a') as f:
+                f.write("\n\n--- Match Statistics ---\n")
+                f.write(f"Total Valid Images: {len(valid_images)}\n")
+                f.write(f"Exact Matches: {exact_match_count}\n")
+                f.write(f"Fuzzy Matches: {fuzzy_match_count}\n")
+                f.write(f"Exact Match Percentage: {exact_match_count / len(valid_images) * 100:.1f}%\n")
+                f.write(f"Fuzzy Match Percentage: {fuzzy_match_count / len(valid_images) * 100:.1f}%\n")
+                f.write(f"Fuzzy Matching Improvement: {fuzzy_match_count / (exact_match_count or 1) * 100:.1f}%\n")
+                f.write(f"Missing Coordinates: {len(missing_coordinates)}\n")
+        
+        # Cache the results before returning
+        try:
+            cache_data = {
+                'data_state_hash': data_state_hash,
+                'valid_images': valid_images,
+                'stats': {
+                    'exact_match_count': exact_match_count,
+                    'fuzzy_match_count': fuzzy_match_count,
+                    'missing_count': len(missing_coordinates),
+                    'total_valid': len(valid_images)
+                }
+            }
+            
+            with open(cache_file, 'wb') as f:
+                pickle.dump(cache_data, f)
+            print(f"Fuzzy search results cached to {cache_file}")
+        except Exception as e:
+            print(f"Error caching fuzzy search results: {e}")
         
         return valid_images
 
@@ -419,26 +497,47 @@ class DataLoader:
                 print(f"Loading OSM data from cache for {city_code}...")
                 with open(cache_file, 'rb') as f:
                     cached_data = pickle.load(f)
-                    # Verify CRS is still correct
-                    if cached_data['city_edges_gdf'].crs == "EPSG:4326":
+                    # Verify CRS is still correct and check if cache has all required fields
+                    if (cached_data['city_edges_gdf'].crs == "EPSG:4326" and
+                        'non_drivable_gdf' in cached_data and 
+                        'non_drivable_sindex' in cached_data):
                         print(f"OSM data loaded from cache for {city_code}")
-                        return cached_data['city_edges_gdf'], cached_data['city_edges_sindex']
+                        return cached_data['city_edges_gdf'], cached_data['city_edges_sindex'], cached_data['non_drivable_gdf'], cached_data['non_drivable_sindex']
                     else:
-                        print(f"Cached OSM data had invalid CRS, rebuilding...")
+                        if 'non_drivable_gdf' not in cached_data:
+                            print(f"Outdated cache detected (missing non-drivable features). Rebuilding OSM data.")
+                        else:
+                            print(f"Cached OSM data had invalid CRS, rebuilding...")
             
             print(f"Querying OSM for drivable edges in {city_code}...")
             place = city_code_to_place_mapping.get(city_code) # Use the mapping
             if place is None: # Handle unknown city code
                 raise ValueError(f"City code '{city_code}' not found in city code mapping CSV.")
 
-            tags = {
+            # Tags for drivable roads
+            drivable_tags = {
                 "highway": True,
                 "boundary": True,
                 "landuse": True,
                 "leisure": True
             }
 
-            city_edges_gdf = ox.features_from_place(place, tags=tags)
+            # Tags for non-drivable areas (buildings, parks, etc.)
+            non_drivable_tags = {
+                "building": True,
+                "amenity": ["parking"],
+                "parking": ["surface"],
+                "leisure": ["park", "stadium", "miniature_golf", "pitch", "playground"],
+                "landuse": ["grass", "brownfield"],
+                "surface": ["grass"],
+                "place": ["square"],
+            }
+
+            # Get drivable road data
+            city_edges_gdf = ox.features_from_place(place, tags=drivable_tags)
+
+            # Get non-drivable area data
+            non_drivable_gdf = ox.features_from_place(place, tags=non_drivable_tags)
 
             # Verification and enforcement of CRS
             if city_edges_gdf.crs is None:
@@ -447,6 +546,13 @@ class DataLoader:
             elif city_edges_gdf.crs != "EPSG:4326":
                 print(f"Warning: city_edges_gdf CRS was not EPSG:4326, reprojecting from {city_edges_gdf.crs} to EPSG:4326")
                 city_edges_gdf = city_edges_gdf.to_crs("EPSG:4326")
+
+            if non_drivable_gdf.crs is None:
+                print("Warning: non_drivable_gdf CRS was None, setting to EPSG:4326")
+                non_drivable_gdf.crs = "EPSG:4326"
+            elif non_drivable_gdf.crs != "EPSG:4326":
+                print(f"Warning: non_drivable_gdf CRS was not EPSG:4326, reprojecting from {non_drivable_gdf.crs} to EPSG:4326")
+                non_drivable_gdf = non_drivable_gdf.to_crs("EPSG:4326")
 
             # Filter drivable edges
             pedestrian_road_types = [
@@ -483,22 +589,58 @@ class DataLoader:
             mask = np.logical_and.reduce(filter_conditions)
             city_edges_gdf = city_edges_gdf[mask]
 
-            # Create spatial index once and cache it
+            # Create spatial index for drivable edges
             city_edges_sindex = city_edges_gdf.sindex
+            
+            # Filter non-drivable areas (only keep buildings, parks, etc.)
+            non_drivable_gdf = non_drivable_gdf[
+                (non_drivable_gdf['building'].notna()) | 
+                (non_drivable_gdf['amenity'].isin(['parking'])) |
+                (non_drivable_gdf['parking'].isin(['surface'])) |
+                (non_drivable_gdf['leisure'].isin(['park', 'stadium', 'miniature_golf', 'pitch', 'playground'])) |
+                (non_drivable_gdf['landuse'].isin(['grass', 'brownfield'])) |
+                (non_drivable_gdf['surface'].isin(['grass'])) |
+                (non_drivable_gdf['place'].isin(['square']))
+            ]
+            
+            # Create spatial index for non-drivable areas
+            non_drivable_sindex = non_drivable_gdf.sindex
             
             # Cache the results
             with open(cache_file, 'wb') as f:
                 pickle.dump({
                     'city_edges_gdf': city_edges_gdf,
-                    'city_edges_sindex': city_edges_sindex
+                    'city_edges_sindex': city_edges_sindex,
+                    'non_drivable_gdf': non_drivable_gdf,
+                    'non_drivable_sindex': non_drivable_sindex
                 }, f)
             
             print(f"OSM data queried, filtered, and cached for {city_code}.")
-            return city_edges_gdf, city_edges_sindex
+            return city_edges_gdf, city_edges_sindex, non_drivable_gdf, non_drivable_sindex
 
         except Exception as e:
             print(f"Error querying OSM data: {e}")
-            return gpd.GeoDataFrame(), None
+            print(f"Exception type: {type(e).__name__}")
+            import traceback
+            traceback.print_exc()
+            return gpd.GeoDataFrame(), None, gpd.GeoDataFrame(), None
+
+    @staticmethod
+    def clear_fuzzy_search_cache():
+        """Clear the fuzzy search cache"""
+        cache_dir = "/outputs/search_cache"
+        if os.path.exists(cache_dir):
+            cache_file = os.path.join(cache_dir, "fuzzy_search_cache.pkl")
+            if os.path.exists(cache_file):
+                try:
+                    os.remove(cache_file)
+                    print(f"Fuzzy search cache cleared: {cache_file}")
+                except Exception as e:
+                    print(f"Error clearing fuzzy search cache: {e}")
+            else:
+                print("No fuzzy search cache found to clear")
+        else:
+            print("Cache directory does not exist")
 
 # Initialize the DataLoader for convenience
 data_loader = DataLoader()
@@ -537,6 +679,38 @@ class OSMProcessor:
             buffered_osm_edges = []
         
         return precise_matches['geometry'].tolist(), buffered_osm_edges
+
+    @staticmethod
+    def get_osm_non_drivable_features(bbox_polygon, non_drivable_gdf, non_drivable_sindex):
+        """Get non-drivable features (buildings, parks, etc.) from OSM within a bounding box"""
+        if non_drivable_gdf.empty or non_drivable_sindex is None:
+            return []
+            
+        # Define buffer distance for building footprints
+        buffer_distance = 0.5  # 0.5 meters (smaller than road buffer)
+        
+        # Get UTM CRS for this bbox
+        centroid = bbox_polygon.centroid
+        utm_crs = get_utm_projection(centroid.x, centroid.y)
+        
+        # Query OSM data using spatial index
+        possible_matches_index = list(non_drivable_sindex.intersection(bbox_polygon.bounds))
+        possible_matches = non_drivable_gdf.iloc[possible_matches_index]
+        
+        # Get features that intersect with the bbox
+        precise_matches = possible_matches[possible_matches.intersects(bbox_polygon)]
+        
+        # Buffer building footprints slightly in UTM
+        if not precise_matches.empty:
+            precise_matches_utm = precise_matches.to_crs(utm_crs)
+            buffered_matches_utm = precise_matches_utm.copy()
+            buffered_matches_utm['geometry'] = buffered_matches_utm.geometry.buffer(buffer_distance)
+            buffered_matches = buffered_matches_utm.to_crs("EPSG:4326")
+            non_drivable_features = buffered_matches['geometry'].tolist()
+        else:
+            non_drivable_features = []
+        
+        return non_drivable_features
 
     @staticmethod
     def create_osm_mask(geometries, image_size, bbox, is_lines=False):
@@ -661,6 +835,113 @@ class MaskProcessor:
         final_mask = (final_mask > 0.1).astype(np.uint8)
         
         return final_mask
+    
+    @staticmethod
+    def is_mask_coverage_insufficient(mask, image_size, min_coverage_percent=1.0):
+        """
+        Detect if mask coverage is insufficient by checking if it covers at least some 
+        minimal percentage of the image. Returns True if mask is insufficient.
+        
+        Args:
+            mask: The binary mask (numpy array)
+            image_size: Tuple (width, height) of the original image
+            min_coverage_percent: Minimum percentage of image that should be covered by masks
+            
+        Returns:
+            bool: True if mask coverage is insufficient
+        """
+        # Calculate image area and masked area
+        total_pixels = image_size[0] * image_size[1]
+        masked_pixels = np.count_nonzero(mask)
+        
+        # Calculate coverage percentage
+        coverage_percent = (masked_pixels / total_pixels) * 100
+        
+        # Check if coverage is below threshold
+        return coverage_percent < min_coverage_percent
+    
+    @staticmethod
+    def merge_masks_with_fallback(sam_mask, fallback_mask, image_size, osm_drivable_mask=None, max_overlap_percent=10.0):
+        """
+        Merge SAM-generated masks with fallback OSM non-drivable feature masks.
+        Prioritizes SAM masks over building footprints in areas where valid segmentation exists.
+        Now evaluates each building polygon individually rather than the whole mask.
+        
+        Args:
+            sam_mask: Binary mask from SAM model
+            fallback_mask: Binary mask from OSM non-drivable features (buildings, etc.)
+            image_size: Tuple (width, height) of the original image
+            osm_drivable_mask: Binary mask of drivable areas from OSM (optional)
+            max_overlap_percent: Maximum allowed overlap between a building and ANY SAM mask
+                                before the building is excluded (default: 10%)
+            
+        Returns:
+            numpy.ndarray: Combined binary mask
+        """
+        # Resize masks to match image size
+        if sam_mask.shape[::-1] != image_size:
+            sam_mask = cv2.resize(sam_mask, image_size, interpolation=cv2.INTER_NEAREST)
+        
+        if fallback_mask.shape[::-1] != image_size:
+            fallback_mask = cv2.resize(fallback_mask, image_size, interpolation=cv2.INTER_NEAREST)
+            
+        if osm_drivable_mask is not None and osm_drivable_mask.shape[::-1] != image_size:
+            osm_drivable_mask = cv2.resize(osm_drivable_mask, image_size, interpolation=cv2.INTER_NEAREST)
+        
+        # Start with just the SAM mask
+        combined_mask = sam_mask.copy()
+        
+        # Extract individual building contours
+        building_contours, _ = cv2.findContours(
+            fallback_mask.astype(np.uint8), 
+            cv2.RETR_EXTERNAL, 
+            cv2.CHAIN_APPROX_SIMPLE
+        )
+        
+        # Process each building individually
+        retained_buildings_mask = np.zeros_like(fallback_mask)
+        
+        for contour in building_contours:
+            # Create a mask for this individual building
+            building_mask = np.zeros_like(fallback_mask)
+            cv2.drawContours(building_mask, [contour], 0, 1, -1)  # Fill the contour
+            
+            # First check: Remove building if it overlaps with roads
+            if osm_drivable_mask is not None:
+                road_overlap = cv2.bitwise_and(building_mask, osm_drivable_mask)
+                # If the building has ANY significant overlap with roads, skip it
+                road_overlap_pixels = np.count_nonzero(road_overlap)
+                building_pixels = np.count_nonzero(building_mask)
+                
+                if building_pixels > 0 and (road_overlap_pixels / building_pixels) * 100 > 5.0:
+                    # Skip this building as it has too much road overlap
+                    continue
+            
+            # Second check: Does this building have significant overlap with ANY SAM mask?
+            # If so, exclude it completely
+            sam_overlap = cv2.bitwise_and(building_mask, sam_mask)
+            sam_overlap_pixels = np.count_nonzero(sam_overlap)
+            building_pixels = np.count_nonzero(building_mask)
+            
+            # Calculate overlap percentage 
+            overlap_percent = 0
+            if building_pixels > 0:
+                overlap_percent = (sam_overlap_pixels / building_pixels) * 100
+            
+            # Only include buildings with little to no SAM mask overlap
+            if overlap_percent <= max_overlap_percent:
+                # Accept this building as it has little to no overlap with SAM masks
+                retained_buildings_mask = cv2.bitwise_or(retained_buildings_mask, building_mask)
+        
+        # Combine SAM mask with the retained buildings
+        combined_mask = cv2.bitwise_or(combined_mask, retained_buildings_mask)
+        
+        # Apply some post-processing to smooth the combined mask
+        combined_mask = cv2.GaussianBlur(combined_mask.astype(np.float32), (3, 3), 0)
+        _, combined_mask = cv2.threshold(combined_mask, 0.5, 1, cv2.THRESH_BINARY)
+        combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, CV2_STRUCTURING_ELEMENT)
+        
+        return combined_mask.astype(np.uint8)
 
     @staticmethod
     def calculate_real_world_area(mask, bbox, image_size):
@@ -821,21 +1102,26 @@ class GeometryProcessor:
         for future in as_completed(futures):
             print(future.result())
 
-# Initialize the processors
+# Initialize processors
+# ===================================================================================================
+data_loader = DataLoader()
 osm_processor = OSMProcessor()
 mask_processor = MaskProcessor()
 geometry_processor = GeometryProcessor()
 
-@app.function(volumes={"/weights": weights_volume, 
-                     "/inputs": inputs_volume,
-                     "/outputs": outputs_volume,
-                     "/scratch": scratch_volume
-                     }, 
-            image=infer_image, 
-            gpu="L40S", 
-            secrets=[modal.Secret.from_name("wandb-secret", environment_name="sam_test")],
-            timeout=36000)
-def run_inference(model_path: str, mode: str, city_code: str, force: bool = False):
+@app.function(
+    volumes={
+        "/weights": weights_volume, 
+        "/inputs": inputs_volume,
+        "/outputs": outputs_volume,
+        "/scratch": scratch_volume
+    }, 
+    image=infer_image, 
+    gpu="L4",
+    secrets=[modal.Secret.from_name("wandb-secret", environment_name="sam_test")],
+    timeout=36000
+)
+def run_inference(model_path: str, mode: str, city_code: str, force: bool = False, rebuild_cache: bool = False, max_overlap_percent: float = 10.0):
     """
     Main inference function running on Modal.
     
@@ -844,21 +1130,9 @@ def run_inference(model_path: str, mode: str, city_code: str, force: bool = Fals
         mode: Running mode ('test' or 'production')
         city_code: City code to process
         force: Whether to force reprocessing of existing outputs
+        rebuild_cache: Whether to force rebuild of the fuzzy search cache
+        max_overlap_percent: Maximum allowed SAM overlap percentage for building footprints (default: 10%)
     """
-    import os
-    from dotenv import load_dotenv
-    import numpy as np
-    import cv2
-    import geopandas as gpd
-    from shapely.geometry import box
-    from shapely.ops import unary_union
-    import torch
-    import supervision as sv
-    from sam2.build_sam import build_sam2
-    from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
-    import random
-    import wandb
-    from shapely.validation import make_valid
     
     # Set environment variables for optimization
     os.environ["WANDB_API_KEY"] = os.environ["WANDB_API_KEY"]
@@ -925,15 +1199,27 @@ def run_inference(model_path: str, mode: str, city_code: str, force: bool = Fals
     if not city_code_to_place_mapping:
         print("City code mapping loading failed. Using fallback approach.")
 
-    city_edges_gdf, city_edges_sindex = DataLoader.load_city_osm_data(city_code, city_code_to_place_mapping)
+    city_edges_gdf, city_edges_sindex, non_drivable_gdf, non_drivable_sindex = DataLoader.load_city_osm_data(city_code, city_code_to_place_mapping)
     if city_edges_gdf.empty or city_edges_sindex is None:
         print("City OSM data loading failed. Exiting.")
         return
+    
+    if non_drivable_gdf.empty or non_drivable_sindex is None:
+        print("Warning: Non-drivable OSM features not loaded. Building fallback will not be available.")
+        # Create empty DataFrames as placeholders
+        non_drivable_gdf = gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+        non_drivable_sindex = None
 
     # Load intersection coordinates if available
     csv_path = "/scratch/intersection_coordinates_v2_0.csv"
     if os.path.exists(csv_path):
         print(f"Loading allowed crosswalk IDs from {csv_path}")
+        
+        # Clear cache if rebuild_cache is True
+        if rebuild_cache:
+            print("Force rebuilding fuzzy search cache")
+            DataLoader.clear_fuzzy_search_cache()
+            
         valid_images = DataLoader.load_and_filter_images(csv_path, "/inputs")
         print(f"Found {len(valid_images)} matching images")
         
@@ -954,8 +1240,8 @@ def run_inference(model_path: str, mode: str, city_code: str, force: bool = Fals
     # Initialize wandb for tracking
     wandb.init(
         project="pedestrian-crossing-distance",
-        name=f"{city_code}-{model_path}-L40S-optimized",
-        tags=[city_code, model_path, "drivable_filter", "spatial_index", "L40S-optimized"],
+        name=f"{city_code}-{model_path}-L4-optimized",
+        tags=[city_code, model_path, "drivable_filter", "spatial_index", "L40S-optimized", "building-fallback", "smart-combine"],
         config={
             **MASK_GENERATOR_CONFIG,
             # SAM Parameters
@@ -970,6 +1256,18 @@ def run_inference(model_path: str, mode: str, city_code: str, force: bool = Fals
             "max_absolute_overlap": MAX_ABSOLUTE_OVERLAP,
             "min_crosswalk_area": MIN_CROSSWALK_AREA,
             
+            # Fallback Parameters
+            "use_building_fallback": True,
+            "always_apply_fallback": True,
+            "smart_building_combination": True,
+            "prioritize_sam_over_buildings": True,
+            "remove_building_road_overlaps": True,
+            "fallback_coverage_threshold": 1.0,  # Kept for reference but no longer used
+            
+            # Performance Optimization
+            "fuzzy_search_cache_enabled": True,
+            "fuzzy_search_cache_forced_rebuild": rebuild_cache,
+            
             # Image Processing
             "image_size": IMAGE_SIZE,
             "output_resolution": "original",
@@ -982,8 +1280,9 @@ def run_inference(model_path: str, mode: str, city_code: str, force: bool = Fals
             "city_code": city_code,
             "osm_method": "spatial_index",
             "city_mapping_source": "city_code_mapping.csv",
-            "platform": "modal-L40S",
-            "force_processing": force
+            "platform": "modal-L4",
+            "force_processing": force,
+            "max_overlap_percent": max_overlap_percent
         }
     )
 
@@ -993,6 +1292,7 @@ def run_inference(model_path: str, mode: str, city_code: str, force: bool = Fals
     # Set up counters for tracking
     processed_count = 0
     skipped_count = 0
+    fallback_count = 0
     
     # Initialize collection for test mode visualization
     collected_images = [] if mode == "test" else None
@@ -1042,6 +1342,11 @@ def run_inference(model_path: str, mode: str, city_code: str, force: bool = Fals
         original_osm_edges, buffered_osm_edges = OSMProcessor.get_osm_drivable_edges(
             bbox_poly, city_edges_gdf, city_edges_sindex)
         osm_mask = OSMProcessor.create_osm_mask(buffered_osm_edges, (IMAGE_SIZE, IMAGE_SIZE), bbox)
+        
+        # Get non-drivable features (buildings, parks, etc.) as fallback
+        non_drivable_features = OSMProcessor.get_osm_non_drivable_features(
+            bbox_poly, non_drivable_gdf, non_drivable_sindex)
+        non_drivable_mask = OSMProcessor.create_osm_mask(non_drivable_features, (IMAGE_SIZE, IMAGE_SIZE), bbox)
 
         # Filter masks based on OSM overlap
         valid_masks = []
@@ -1096,7 +1401,92 @@ def run_inference(model_path: str, mode: str, city_code: str, force: bool = Fals
         osm_buffer_contours, _ = cv2.findContours(
             buffered_osm_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cv2.drawContours(annotated, osm_buffer_contours, -1, (0, 255, 0), 2)
-
+        
+        # Process final mask
+        sam_mask = MaskProcessor.process_masks_parallel(valid_masks, original_size)
+        
+        # Always use building footprints as fallback regardless of SAM mask coverage
+        print(f"Applying OSM non-drivable features for {image_name}.")
+        # Resize non-drivable mask to match original image size
+        resized_non_drivable_mask = cv2.resize(non_drivable_mask, original_size, interpolation=cv2.INTER_NEAREST)
+        # Resize OSM drivable area mask to match original image size
+        resized_osm_drivable_mask = cv2.resize(osm_mask, original_size, interpolation=cv2.INTER_NEAREST)
+        
+        # Create a downscaled version of the sam_mask for visualization
+        downscaled_sam_mask = cv2.resize(sam_mask, (IMAGE_SIZE, IMAGE_SIZE), interpolation=cv2.INTER_NEAREST)
+        
+        # Define the maximum overlap percentage (same as in merge_masks_with_fallback)
+        max_overlap_percent = 10.0
+        
+        # Extract individual building contours for visualization
+        building_contours, _ = cv2.findContours(
+            non_drivable_mask.astype(np.uint8), 
+            cv2.RETR_EXTERNAL, 
+            cv2.CHAIN_APPROX_SIMPLE
+        )
+        
+        # Process each building polygon individually for visualization
+        standalone_buildings_mask = np.zeros_like(non_drivable_mask)
+        overlapping_buildings_mask = np.zeros_like(non_drivable_mask)
+        road_overlapping_buildings_mask = np.zeros_like(non_drivable_mask)
+        
+        for contour in building_contours:
+            # Create a mask for this individual building
+            building_mask = np.zeros_like(non_drivable_mask)
+            cv2.drawContours(building_mask, [contour], 0, 1, -1)  # Fill the contour
+            
+            # Check road overlap
+            road_overlap = cv2.bitwise_and(building_mask, osm_mask)
+            road_overlap_pixels = np.count_nonzero(road_overlap)
+            building_pixels = np.count_nonzero(building_mask)
+            road_overlap_percent = 0
+            if building_pixels > 0:
+                road_overlap_percent = (road_overlap_pixels / building_pixels) * 100
+            
+            # Check SAM mask overlap
+            sam_overlap = cv2.bitwise_and(building_mask, downscaled_sam_mask)
+            sam_overlap_pixels = np.count_nonzero(sam_overlap)
+            sam_overlap_percent = 0
+            if building_pixels > 0:
+                sam_overlap_percent = (sam_overlap_pixels / building_pixels) * 100
+            
+            if road_overlap_percent > 5.0:
+                # Building overlaps with roads
+                road_overlapping_buildings_mask = cv2.bitwise_or(road_overlapping_buildings_mask, building_mask)
+            elif sam_overlap_percent <= max_overlap_percent:
+                # Standalone building with little to no SAM overlap - will be used
+                standalone_buildings_mask = cv2.bitwise_or(standalone_buildings_mask, building_mask)
+            else:
+                # Building overlaps significantly with SAM masks - won't be used
+                overlapping_buildings_mask = cv2.bitwise_or(overlapping_buildings_mask, building_mask)
+        
+        # Update the visualization with the categorized building masks
+        # 1. All building footprints (thin, light magenta outline for context)
+        all_building_contours, _ = cv2.findContours(
+            non_drivable_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(annotated, all_building_contours, -1, (180, 100, 180), 1)  # Light magenta, thin
+        
+        # 2. Buildings that overlap with roads (yellow)
+        if np.any(road_overlapping_buildings_mask):
+            road_overlap_contours, _ = cv2.findContours(
+                road_overlapping_buildings_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(annotated, road_overlap_contours, -1, (255, 255, 0), 2)  # Yellow
+            print(f"Buildings with road overlap: {np.count_nonzero(road_overlapping_buildings_mask)} pixels")
+        
+        # 3. Buildings that overlap with SAM masks (orange) - these won't be used
+        if np.any(overlapping_buildings_mask):
+            sam_overlap_contours, _ = cv2.findContours(
+                overlapping_buildings_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(annotated, sam_overlap_contours, -1, (255, 165, 0), 2)  # Orange
+            print(f"Buildings with significant SAM overlap (excluded): {np.count_nonzero(overlapping_buildings_mask)} pixels")
+            
+        # 4. Standalone buildings with little to no SAM overlap (bright cyan) - these will be used
+        if np.any(standalone_buildings_mask):
+            standalone_contours, _ = cv2.findContours(
+                standalone_buildings_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(annotated, standalone_contours, -1, (0, 255, 255), 2)  # Cyan, thicker
+            print(f"Standalone buildings used in final mask: {np.count_nonzero(standalone_buildings_mask)} pixels")
+        
         # Save the annotated image
         async_write(output_path, rgb_to_bgr(annotated))
         print(f"Saved output to: {output_path}")
@@ -1111,8 +1501,39 @@ def run_inference(model_path: str, mode: str, city_code: str, force: bool = Fals
                 )
             )
 
-        # Process final mask
-        final_mask = MaskProcessor.process_masks_parallel(valid_masks, original_size)
+        # Merge SAM masks with non-drivable features while avoiding road overlaps
+        final_mask = MaskProcessor.merge_masks_with_fallback(
+            sam_mask, 
+            resized_non_drivable_mask, 
+            original_size,
+            osm_drivable_mask=resized_osm_drivable_mask,
+            max_overlap_percent=max_overlap_percent
+        )
+        
+        # Log metrics
+        sam_coverage = (np.count_nonzero(sam_mask) / (original_size[0] * original_size[1])) * 100
+        building_coverage = (np.count_nonzero(resized_non_drivable_mask) / (original_size[0] * original_size[1])) * 100
+        combined_coverage = (np.count_nonzero(final_mask) / (original_size[0] * original_size[1])) * 100
+        
+        # Calculate how many building pixels were removed due to road overlap
+        naively_combined = cv2.bitwise_or(sam_mask, resized_non_drivable_mask)
+        naive_coverage = (np.count_nonzero(naively_combined) / (original_size[0] * original_size[1])) * 100
+        road_overlap_pct = naive_coverage - combined_coverage
+        
+        print(f"SAM mask coverage: {sam_coverage:.2f}%")
+        print(f"Building footprint coverage: {building_coverage:.2f}%")
+        print(f"Combined mask coverage: {combined_coverage:.2f}%")
+        print(f"Road overlap correction: {road_overlap_pct:.2f}%")
+        
+        wandb.log({
+            "fallback_used": True,
+            "image_name": image_name,
+            "sam_mask_coverage_percent": sam_coverage,
+            "fallback_mask_coverage_percent": building_coverage,
+            "combined_mask_coverage_percent": combined_coverage,
+            "road_overlap_correction_percent": road_overlap_pct
+        })
+        fallback_count += 1
         
         # Find contours from mask
         contours, _ = cv2.findContours(final_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -1172,6 +1593,7 @@ def run_inference(model_path: str, mode: str, city_code: str, force: bool = Fals
     print(f"Total images checked: {len(input_set)}")
     print(f"Images processed: {processed_count}")
     print(f"Images skipped (already processed): {skipped_count}")
+    print(f"Images with building footprints applied: {fallback_count} (100.0%)")
     
     # Export results to GeoDataFrame
     if shapefile_data:
@@ -1194,17 +1616,21 @@ def run_inference(model_path: str, mode: str, city_code: str, force: bool = Fals
         wandb.log({
             "processed_images": collected_images,
             "images_processed": processed_count,
-            "images_skipped": skipped_count
+            "images_skipped": skipped_count,
+            "images_with_building_footprints": fallback_count
         })
         wandb.finish()
 
+# Entry point for local execution
+# ===================================================================================================
 @app.local_entrypoint()
-def main(model: str, mode: str, force: bool = False):
+def main(model: str, mode: str, force: bool = False, rebuild_cache: bool = False, max_overlap_percent: float = 10.0):
     """Main entry point for local execution"""
-    city_code = os.environ.get("MODAL_ENVIRONMENT")
     run_inference.remote(
         model_path=model,
         mode=mode,
-        city_code=city_code,
-        force=force
+        city_code=ENV_NAME,  # Use the same ENV_NAME from the top of the file
+        force=force,
+        rebuild_cache=rebuild_cache,
+        max_overlap_percent=max_overlap_percent
     )

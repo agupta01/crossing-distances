@@ -37,14 +37,12 @@ committer_image = (
     .env({"TINI_SUBREAPER": "1"})
 )
 
-# Get environment with fallback to prevent errors when running locally
-ENV_NAME = os.environ.get('MODAL_ENVIRONMENT', 'local')
 dataset_volume = modal.Volume.from_name(
-    f"crosswalk-data-{ENV_NAME}", create_if_missing=True, environment_name=ENV_NAME
+    f"crosswalk-data-{os.environ['MODAL_ENVIRONMENT']}", create_if_missing=True
 )
 
 redrive_dict = modal.Dict.from_name(
-    f"crosswalk-data-{ENV_NAME}-redrive", create_if_missing=True, environment_name=ENV_NAME
+    f"crosswalk-data-{os.environ['MODAL_ENVIRONMENT']}-redrive", create_if_missing=True
 )
 
 main_scratch = modal.Volume.from_name(

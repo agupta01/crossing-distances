@@ -216,7 +216,7 @@ def filter_coordinates(
     return filtered_coords
 
 
-def fuzzy_search_optimized(query: str, string_list: list[str]) -> str:
+def fuzzy_search_optimized(query: str, string_set: set[str], string_list: list[str]) -> str:
     """
     Performs a fuzzy search to find the string with most matching characters in same positions.
 
@@ -227,6 +227,9 @@ def fuzzy_search_optimized(query: str, string_list: list[str]) -> str:
     Returns:
         Best matching string from the list
     """
+    if query in string_set:
+        return query
+    
     query_length = len(query)
     max_matches = 0
     best_match = string_list[0]

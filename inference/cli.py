@@ -1,29 +1,36 @@
 import argparse
+import logging
 import os
-import tempfile
 import subprocess
+import tempfile
 from contextlib import contextmanager
+from logging import Logger
 
 import modal
 from modal.functions import FunctionCall
 from tqdm.auto import tqdm
 
 from inference.utils import (
-    create_logger,
+    APP_NAME,
     app,
+    create_logger,
     filter_coordinates,
     fuzzy_search_optimized,
     get_from_volume,
     main_scratch,
+    osmnx_image,
 )
-from inference.utils import osmnx_image
-from inference.utils import APP_NAME
 
 
 def read_envs_file(envs_path: str):
     import pandas as pd
 
-    return pd.read_csv(envs_path, delimiter="\t")
+    if envs_path.endswith(".csv"):
+        return pd.read_csv(envs_path)
+    elif envs_path.endswith(".tsv"):
+        return pd.read_csv(envs_path, delimiter="\t")
+    else:
+        raise ValueError("Unsupported file format")
 
 
 def deploy(envs_path: str, functions_file: str, subset: str | None = None):
@@ -98,16 +105,18 @@ def verify(env_name: str, logger: Logger):
     # Check intersection list in scratch volume
     crosswalks_df = pd.read_csv(
         get_from_volume(
-            "scratch", "intersection_coordinates.csv", environment_name=env_name
+            "scratch", "intersection_coordinates_v2_0.csv", environment_name=env_name
         )
     )
     crosswalks_vol = modal.Volume.lookup(
-        f"crosswalk-data-{env_name}", environment_name=env_name
+        f"crosswalk-data-{env_name if env_name != 'irv' else 'sna'}", environment_name=env_name
     )
     filenames = list(map(lambda x: x.path, crosswalks_vol.listdir("/")))
+    logger.info(f"Loaded {len(filenames)} crosswalk images")
     missing_coords: pd.DataFrame = filter_coordinates(
-        crosswalks_df, env_name, -1, logger, return_df=True
+        crosswalks_df, env_name if env_name != 'irv' else 'sna', -1, logger, return_df=True
     )
+    logger.info(f"Filtered to {len(missing_coords)} missing crosswalk images")
     if len(missing_coords) != 0:
         missing_coords["best_match"] = missing_coords["filename"].apply(
             lambda x: fuzzy_search_optimized(x, filenames)
@@ -120,7 +129,7 @@ def verify(env_name: str, logger: Logger):
             axis=1,
         )
         missing_coords.to_csv(
-            f"/scratch/missing_intersections_{env_name}.csv", index=False
+            f"~/scratch/missing_intersections_{env_name}.csv", index=False
         )
         logger.error(
             f"[MISSING INTERSECTIONS] {len(missing_coords)} intersections missing in {env_name}. Missing coordinates and closest matches are saved at /scratch/missing_intersections_{env_name}.csv"
@@ -162,6 +171,8 @@ def run_single_city(
         call = f.spawn(city_code=env_name, sample=-1, batch_size=1000)
     elif function == "osm_ingest":
         call = f.spawn(place=place)
+    elif function == "grow_cut":
+        call = f.spawn()
     else:
         raise ValueError(f"Function {function} not recognized")
     return call
@@ -248,6 +259,15 @@ def main():
         help="Destination directory to save the file.",
     )
 
+    # Verification command
+    verify_parser = subparsers.add_parser("verify", help="Verify an environment has all intersections and create a missing_intersections file")
+    verify_parser.add_argument(
+        "--envs-code",
+        type=str,
+        required=True,
+        help='Environment code',
+    )
+
     args = parser.parse_args()
 
     if args.command == "deploy":
@@ -256,7 +276,10 @@ def main():
         run(args.envs_path, args.function, args.subset)
     elif args.command == "get":
         get_file_from_all_envs(args.envs_path, args.filename, args.destination_dir)
-
+    elif args.command == "verify":
+        logger = logging.getLogger(__name__)
+        logger.setLevel(logging.INFO)
+        verify(args.envs_code, logger)
 
 if __name__ == "__main__":
     main()

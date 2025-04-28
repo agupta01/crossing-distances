@@ -173,3 +173,7 @@ cython_debug/
 /inference/wandb
 /inference/cache
 /inference/..data
+entropy.ipynb
+lambda_deploy.zip
+Untitled.ipynb
+.vscode/settings.json

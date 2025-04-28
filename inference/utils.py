@@ -3,6 +3,7 @@ import math
 import os
 from collections import namedtuple
 from io import BytesIO
+import pandas as pd
 
 import modal
 
@@ -11,6 +12,7 @@ app = modal.App(APP_NAME)
 
 PRECISION = 6  # decimal points = 111mm resolution
 RADIUS = 25.0  # meters. Default size of an intersection
+EPSILON = 1e-6
 
 Coordinate = namedtuple("Coordinate", ["lat", "long"])
 
@@ -20,7 +22,7 @@ trunc_explanation = (
 
 osmnx_image = (
     modal.Image.from_registry("gboeing/osmnx:latest")
-    .pip_install("geopy")
+    .pip_install("geopy", "semver>=3.0.4")
     .env({"TINI_SUBREAPER": "1"})
 )
 
@@ -103,7 +105,12 @@ def create_logger():
 
     handler.setFormatter(formatter)
     logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
+    raw_log_level = os.environ.get("LOG_LEVEL", "INFO").strip()
+    try:
+        log_level = int(raw_log_level)
+    except ValueError:
+        log_level = raw_log_level.upper()         # fall back to named level
+    logger.setLevel(log_level)
 
     return logger
 
@@ -176,7 +183,7 @@ def dist(a, b):
 
 def filter_coordinates(
     df, city_code, sample, logger, return_length=False, return_df=False
-):
+) -> pd.DataFrame:
     # Sample the dataframe and round coordinates
     sampled_df = df.sample(n=sample if sample > 0 else len(df))
     sampled_df["coords"] = sampled_df.apply(

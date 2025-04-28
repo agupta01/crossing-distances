@@ -174,7 +174,7 @@ def main(city_code: str | None = None, sample: int = 1000, batch_size: int = 100
 
     df = pd.read_csv(
         get_from_volume(
-            "scratch", "intersection_coordinates.csv", environment_name=city_code
+            "scratch", "intersection_coordinates_v2_0.csv", environment_name=city_code
         )
     )
     coords = filter_coordinates(df, city_code, sample, logger)

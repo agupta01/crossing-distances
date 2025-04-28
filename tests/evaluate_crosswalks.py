@@ -65,9 +65,18 @@ def kl_divergence(set1, set2, bins):
 
 
 def plot_length_histograms(
-    before_lengths, after_lengths, before_name, after_name, save_path
+    before_lengths,
+    after_lengths,
+    paired,
+    before_name,
+    after_name,
+    save_path,
 ):
     """Plot histograms of crosswalk lengths before and after."""
+    # Filter before_lengths to those in paired
+    before_lengths = before_lengths[paired.index_before]
+    after_lengths = after_lengths[paired.index_after]
+
     plt.figure(figsize=(10, 6))
     plt.gcf().set_facecolor("#D3D3D3")
     plt.hist(
@@ -85,6 +94,7 @@ def plot_length_histograms(
         color="#4DFFFC",
         label=after_name,
     )
+    plt.xscale("log")
     plt.xlabel("Length (feet)")
     plt.ylabel("Frequency")
     plt.title("Crosswalk Length Distribution")
@@ -93,8 +103,12 @@ def plot_length_histograms(
     plt.close()
 
 
-def plot_kl_divergence(before_lengths, after_lengths, save_path):
+def plot_kl_divergence(before_lengths, after_lengths, paired, save_path):
     """Plot KL divergence over different bin counts."""
+    # Filter before_lengths to those in paired
+    before_lengths = before_lengths[paired.index_before]
+    after_lengths = after_lengths[paired.index_after]
+
     bins = list(range(10, 5000, 10))
     divergences = [kl_divergence(before_lengths, after_lengths, b) for b in bins]
 
@@ -105,6 +119,22 @@ def plot_kl_divergence(before_lengths, after_lengths, save_path):
     plt.title("Divergence over bin count")
     plt.savefig(str(save_path / "kl_divergence.png"))
     plt.close()
+
+
+def filter_crosswalks_in_area(after_gdf, after_lengths, save_path, low, high):
+    """Filter all crosswalks that are in the length range [low, high], in feet.
+
+    Args:
+        after_gdf (GeoDataFrame): "after" GeoDataSeries with length in feet
+        save_path (Path): Directory to save filtered GeoJSONs
+        low (float): Lower bound of length range
+        high (float): Upper bound of length range
+    """
+    after_gdf["length_ft"] = after_lengths
+    after_gdf = after_gdf[after_gdf["length_ft"] >= low]
+    after_gdf = after_gdf[after_gdf["length_ft"] <= high]
+    after_gdf = after_gdf.reset_index()[["index", "geometry"]]
+    after_gdf.to_file(save_path / "after_filtered.shp")
 
 
 def pair_crosswalks(before_gdf, after_gdf):
@@ -166,6 +196,7 @@ def main():
     )
     parser.add_argument("--after", required=True, help="Name for after dataset")
     parser.add_argument("--plots-path", help="Directory to save plots")
+    parser.add_argument("--save-path", help="Directory to save filtered crosswalks")
 
     args = parser.parse_args()
 
@@ -203,15 +234,30 @@ def main():
     print(f"Max: {paired['difference'].max():.2f} feet")
     print(f"Min: {paired['difference'].min():.4f} feet")
 
+    if args.save_path:
+        save_path = Path(args.save_path)
+        after_lengths.to_csv(save_path / "after_lengths.csv", index=True)
+        # filter_crosswalks_in_area(after_gdf, after_lengths, save_path, 35, 40)
+
     # Generate plots if path is specified
     if args.plots_path:
         plots_path = Path(args.plots_path)
         plots_path.mkdir(parents=True, exist_ok=True)
 
         plot_length_histograms(
-            before_lengths, after_lengths, args.before, args.after, plots_path
+            before_lengths,
+            after_lengths,
+            paired,
+            args.before,
+            args.after,
+            plots_path,
         )
-        plot_kl_divergence(before_lengths.values, after_lengths.values, plots_path)
+        plot_kl_divergence(
+            before_lengths.values,
+            after_lengths.values,
+            paired,
+            plots_path,
+        )
         plot_paired_differences(paired, plots_path)
         print(f"\nPlots saved to: {plots_path}")
 

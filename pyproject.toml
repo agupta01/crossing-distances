@@ -12,5 +12,6 @@ dependencies = [
     "pytest>=8.3.4",
     "python-dotenv>=1.0.1",
     "segment-geospatial>=0.12.2",
+    "semver>=3.0.4",
     "timm==1.0.9",
 ]

@@ -9,8 +9,8 @@ from tqdm.contrib.logging import logging_redirect_tqdm
 
 from inference.utils import EPSILON, app, create_logger, osmnx_image
 
-GROW_RATE = 1000
-RETRIES = 1
+GROW_RATE = 30
+RETRIES = 15
 
 scratch_volume = modal.Volume.from_name("scratch", create_if_missing=True)
 geofiles_volume = modal.Volume.from_name(

@@ -109,7 +109,7 @@ def create_logger():
     try:
         log_level = int(raw_log_level)
     except ValueError:
-        log_level = raw_log_level.upper()         # fall back to named level
+        log_level = raw_log_level.upper()  # fall back to named level
     logger.setLevel(log_level)
 
     return logger
@@ -170,7 +170,7 @@ def bounding_box_from_filename(filename: str) -> tuple[float, float, float, floa
 def get_from_volume(
     volume_name: str, file_path: str, environment_name: str | None = None
 ) -> BytesIO:
-    volume = modal.Volume.lookup(volume_name, environment_name=environment_name)
+    volume = modal.Volume.from_name(volume_name, environment_name=environment_name)
     data = b""
     for chunk in volume.read_file(file_path):
         data += chunk
@@ -223,7 +223,9 @@ def filter_coordinates(
     return filtered_coords
 
 
-def fuzzy_search_optimized(query: str, string_set: set[str], string_list: list[str]) -> str:
+def fuzzy_search_optimized(
+    query: str, string_set: set[str], string_list: list[str]
+) -> str:
     """
     Performs a fuzzy search to find the string with most matching characters in same positions.
 
@@ -236,7 +238,7 @@ def fuzzy_search_optimized(query: str, string_set: set[str], string_list: list[s
     """
     if query in string_set:
         return query
-    
+
     query_length = len(query)
     max_matches = 0
     best_match = string_list[0]

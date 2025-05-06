@@ -11,6 +11,7 @@ from inference.utils import EPSILON, app, create_logger, osmnx_image
 
 GROW_RATE = 30
 RETRIES = 15
+TOLERANCE = 0.5  # metres – how far extended line may protrude beyond polygon before we stop growing
 
 scratch_volume = modal.Volume.from_name("scratch", create_if_missing=True)
 geofiles_volume = modal.Volume.from_name(
@@ -47,42 +48,36 @@ def get_spanning_line(multiline):
 
 
 def _grow(line: LineString, buffer: float, sides: tuple[bool, bool]):
-    """Helper function to run grow step of grow-cut."""
-    import math
+    """Grow `line` by `buffer` proportion of its *original* length on the requested `sides`.
 
+    When `sides == (True, True)` both endpoints extend outwards by `buffer*length`.
+    When only one boolean is *True* we still extend that *one* endpoint by the full
+    `buffer*length` instead of half – the previous implementation extended by only
+    half, making growth stall prematurely. The function is idempotent when
+    ``buffer == 0``.
+    """
+    import math
     from shapely.geometry import LineString
 
-    # Extract line coordinates
-    x1, y1 = line.coords[0]
-    x2, y2 = line.coords[-1]
-    dy = y2 - y1
-    dx = x2 - x1
-    length = math.sqrt(dx**2 + dy**2)
+    # Vector components and length
+    (x1, y1), (x2, y2) = line.coords[0], line.coords[-1]
+    dx, dy = x2 - x1, y2 - y1
+    length = math.hypot(dx, dy) + EPSILON  # avoid division-by-zero
 
-    # Calculate new length
-    new_length = (1 + buffer) * length
+    # Unit direction of the line
+    ux, uy = dx / length, dy / length
 
-    # Calulate components of new length
-    new_dx = (dx * new_length) / (length + EPSILON)
-    new_dy = (dy * new_length) / (length + EPSILON)
+    # Offset we have to add per growing side (absolute metres)
+    grow_dist = buffer * length
+    off_x, off_y = ux * grow_dist, uy * grow_dist
 
-    # Calculate center coordinate
-    xc = x1 + (dx / 2)
-    yc = y1 + (dy / 2)
+    # Conditionally move endpoints
+    new_x1 = x1 - off_x if sides[0] else x1
+    new_y1 = y1 - off_y if sides[0] else y1
+    new_x2 = x2 + off_x if sides[1] else x2
+    new_y2 = y2 + off_y if sides[1] else y2
 
-    # Calculate new coordinates
-    if sides[0]:
-        new_x1, new_y1 = xc - (new_dx / 2), yc - (new_dy / 2)
-    else:
-        new_x1, new_y1 = x1, y1
-    if sides[1]:
-        new_x2, new_y2 = xc + (new_dx / 2), yc + (new_dy / 2)
-    else:
-        new_x2, new_y2 = x2, y2
-
-    # Construct new LineString
-    extended_line = LineString([(new_x1, new_y1), (new_x2, new_y2)])
-    return extended_line
+    return LineString([(new_x1, new_y1), (new_x2, new_y2)])
 
 
 def _cut(polygon: Polygon, extended_line: LineString, limit: int = 4):
@@ -116,25 +111,31 @@ def _cut(polygon: Polygon, extended_line: LineString, limit: int = 4):
 def _is_span_too_long(
     span_line: LineString, original_line: LineString
 ) -> tuple[bool, bool]:
-    """Helper to determine if the spanning line is too long, and if so, what side."""
+    """Return a *finished* flag for each side.
+
+    An endpoint is considered *finished* (i.e. we have grown far enough) if the
+    closest distance between that original endpoint and *either* endpoint of the
+    span that still lies inside the polygon is greater than ``TOLERANCE``.
+
+    Using the *closest* span endpoint makes this test orientation-agnostic and
+    fixes cases where the two lines have opposite direction, which previously
+    caused both sides to be marked finished after a single iteration.
+    """
     from shapely.geometry import Point
 
-    span_line_1, span_line_2 = Point(span_line.coords[0]), Point(span_line.coords[-1])
-    original_line_1, original_line_2 = (
-        Point(original_line.coords[0]),
-        Point(original_line.coords[-1]),
-    )
+    span_pts = [Point(c) for c in span_line.coords]
+    orig_pts = [Point(c) for c in original_line.coords]
+
+    # Compute minimal distance from each original endpoint to *any* span endpoint
+    dists = [min(p_orig.distance(p_span) for p_span in span_pts) for p_orig in orig_pts]
+
+    left_finished = dists[0] > EPSILON
+    right_finished = dists[1] > EPSILON
+
     logger.debug(
-        f"Points: {span_line_1}, {span_line_2}, {original_line_1}, {original_line_2}"
+        f"Span distances -> left: {dists[0]:.2f} m, right: {dists[1]:.2f} m | finished: {(left_finished, right_finished)}"
     )
-    values = (
-        span_line_1.distance(original_line_1) > 0.5,
-        span_line_2.distance(original_line_2) > 0.5,
-    )
-    logger.debug(
-        f"Span too long: {values}. Distances are: {span_line_1.distance(original_line_1)}, {span_line_2.distance(original_line_2)}"
-    )
-    return values
+    return left_finished, right_finished
 
 
 def get_line_spans_within_polygon(
@@ -338,7 +339,7 @@ def grow_cut(
         # logger.info(f"Running locally, so sampling to {sample_size} crosswalks")
         # crosswalks_to_intersections = crosswalks_to_intersections.sample(sample_size, random_state=77)
 
-        # Run comput_grow_cut.local on crosswalk_to_intersections using threadpoolexecutor
+        # Run compute_grow_cut.local on crosswalk_to_intersections using threadpoolexecutor
         with ThreadPoolExecutor(max_workers=5) as executor, logging_redirect_tqdm():
             spans = list(
                 executor.map(

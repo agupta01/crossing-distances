@@ -138,6 +138,50 @@ def _is_span_too_long(
     return left_finished, right_finished
 
 
+def _split_line_by_heading(
+    line: LineString, angle_tol_deg: float = 10
+) -> list[LineString]:
+    """
+    Split a LineString into segments grouped by compass heading tolerance.
+    """
+    import math
+
+    coords = list(line.coords)
+    if len(coords) < 2:
+        return []
+
+    def heading(p0, p1):
+        dx = p1[0] - p0[0]
+        dy = p1[1] - p0[1]
+        theta = math.degrees(math.atan2(dy, dx))
+        if theta < 0:
+            theta += 360
+        return theta
+
+    def angular_diff(a, b):
+        diff = abs(a - b) % 360
+        if diff > 180:
+            diff = 360 - diff
+        return diff
+
+    headings = [heading(coords[i], coords[i + 1]) for i in range(len(coords) - 1)]
+    groups = []
+    group_start = 0
+    ref_heading = headings[0]
+    for idx in range(1, len(headings)):
+        h = headings[idx]
+        if angular_diff(h, ref_heading) <= angle_tol_deg:
+            continue
+        groups.append(LineString(coords[group_start : idx + 1]))
+        group_start = idx
+        ref_heading = h
+    # last group
+    final_coords = coords[group_start:]
+    if len(final_coords) >= 2:
+        groups.append(LineString(final_coords))
+    return groups
+
+
 def get_line_spans_within_polygon(
     polygon: Polygon,
     line: LineString,
@@ -207,17 +251,8 @@ def compute_grow_cut(row):
         logger.info("Crosswalk is multilinestring, splitting")
         crosswalk_edges = list(crosswalk_edge.geoms)
     elif len(crosswalk_edge.coords) > 2:
-        logger.debug(
-            f"More than 2 endpoints in edge, splitting: {list(crosswalk_edge.coords)}"
-        )
-        # split using sliding window on normalized edge
-        crosswalk_edges = [
-            LineString([a, b])
-            for a, b in [
-                crosswalk_edge.normalize().coords[i : i + 2]
-                for i in range(len(crosswalk_edge.coords) - 1)
-            ]
-        ]
+        logger.debug(f"More than 2 coordinates in edge, splitting by heading tolerance")
+        crosswalk_edges = _split_line_by_heading(crosswalk_edge, angle_tol_deg=10)
     else:
         crosswalk_edges = [crosswalk_edge]
     logger.log(
@@ -257,7 +292,7 @@ def compute_grow_cut(row):
     cpu=4,
 )
 def grow_cut(
-    version_in: str = "2.0.0", version_out: str = f"2.1.0-grow{GROW_RATE}+{RETRIES}"
+    version_in: str = "2.0.0", version_out: str = f"2.1.1-grow{GROW_RATE}+{RETRIES}"
 ):
     """Runs the grow-cut algorithm on the crosswalks to refine their boundaries.
 

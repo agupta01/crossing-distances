@@ -1,7 +1,12 @@
 import pytest
-from shapely.geometry import LineString, Point
+from shapely.geometry import LineString
 
-from inference.grow_cut import _grow, _is_span_too_long, TOLERANCE
+from inference.grow_cut import (
+    _grow,
+    _is_span_too_long,
+    TOLERANCE,
+    _split_line_by_heading,
+)
 
 
 def test_grow_zero_buffer():
@@ -51,3 +56,21 @@ def test_is_span_too_long_orientation():
     span_swapped = LineString([(extended_dist, 0), (0, 0)])
     lf3, rf3 = _is_span_too_long(span_swapped, original)
     assert lf3 is False and rf3 is True
+
+
+# unit tests for _split_line_by_heading helper
+def test_split_line_by_heading_two_segments():
+    line = LineString([(0, 0), (1, 0), (2, 0), (2, 1)])
+    segments = _split_line_by_heading(line, angle_tol_deg=10)
+    assert len(segments) == 2
+    expected1 = LineString([(0, 0), (2, 0)])
+    expected2 = LineString([(2, 0), (2, 1)])
+    assert segments[0].equals(expected1), f"First segment mismatch: {segments[0].wkt}"
+    assert segments[1].equals(expected2), f"Second segment mismatch: {segments[1].wkt}"
+
+
+def test_split_line_by_heading_no_split():
+    line = LineString([(0, 0), (1, 0), (2, 0.1), (3, 0.2)])
+    segments = _split_line_by_heading(line, angle_tol_deg=10)
+    assert len(segments) == 1
+    assert list(segments[0].coords) == list(line.coords)

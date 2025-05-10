@@ -132,8 +132,9 @@ def _is_span_too_long(
     left_finished = dists[0] > EPSILON
     right_finished = dists[1] > EPSILON
 
-    logger.debug(
-        f"Span distances -> left: {dists[0]:.2f} m, right: {dists[1]:.2f} m | finished: {(left_finished, right_finished)}"
+    logger.log(
+        0,
+        f"Span distances -> left: {dists[0]:.2f} m, right: {dists[1]:.2f} m | finished: {(left_finished, right_finished)}",
     )
     return left_finished, right_finished
 
@@ -211,8 +212,9 @@ def get_line_spans_within_polygon(
     cut_lines = []
     while not (left_finished and right_finished) and try_count < retry_limit:
         try_count += 1
-        logger.debug(
-            f"Try count: {try_count}, left_finished={left_finished}, right_finished={right_finished}"
+        logger.log(
+            0,
+            f"Try count: {try_count}, left_finished={left_finished}, right_finished={right_finished}",
         )
         extended_line = _grow(
             extended_line, buffer, sides=(not left_finished, not right_finished)
@@ -221,20 +223,30 @@ def get_line_spans_within_polygon(
             polygon, extended_line, limit
         )  # list of LineStrings after cut operation
         if all(map(lambda x: x.length < 1, cut_lines)):
-            logger.debug(
-                f"All lines less than 1m long. Lengths: {list(map(lambda x: x.length, cut_lines))}"
+            logger.log(
+                0,
+                f"All lines less than 1m long. Lengths: {list(map(lambda x: x.length, cut_lines))}",
             )
             left_finished, right_finished = True, True
         else:
             left_finished, right_finished = _is_span_too_long(
                 get_spanning_line(MultiLineString(cut_lines)), extended_line
             )
+            # Safeguard: if only one endpoint has finished, halve remaining retries
+            if left_finished != right_finished:
+                remaining = retry_limit - try_count
+                retry_limit = try_count + (remaining // 2)
+                logger.log(
+                    0, f"One endpoint finished; adjusted retry_limit to {retry_limit}"
+                )
 
+    # Safeguard: if retry limit reached and both endpoints unfinished, revert to original line and cut once
+    if try_count >= retry_limit and not left_finished and not right_finished:
+        logger.warning(
+            "Retry limit reached without finishing growth. Reverting to original line and applying single cut."
+        )
+        return _cut(polygon, line, limit)
     return cut_lines
-    # Original algorithm
-    # extended_line = _grow(line, buffer)
-    # cut_lines = _cut(polygon, extended_line, limit)
-    # return cut_lines
 
 
 @app.function(image=osmnx_image)
@@ -251,7 +263,9 @@ def compute_grow_cut(row):
         logger.info("Crosswalk is multilinestring, splitting")
         crosswalk_edges = list(crosswalk_edge.geoms)
     elif len(crosswalk_edge.coords) > 2:
-        logger.debug(f"More than 2 coordinates in edge, splitting by heading tolerance")
+        logger.log(
+            0, f"More than 2 coordinates in edge, splitting by heading tolerance"
+        )
         crosswalk_edges = _split_line_by_heading(crosswalk_edge, angle_tol_deg=10)
     else:
         crosswalk_edges = [crosswalk_edge]
@@ -292,7 +306,7 @@ def compute_grow_cut(row):
     cpu=4,
 )
 def grow_cut(
-    version_in: str = "2.0.0", version_out: str = f"2.1.1-grow{GROW_RATE}+{RETRIES}"
+    version_in: str = "2.0.0", version_out: str = f"2.1.3-grow{GROW_RATE}+{RETRIES}"
 ):
     """Runs the grow-cut algorithm on the crosswalks to refine their boundaries.
 
@@ -308,6 +322,7 @@ def grow_cut(
         refined_crosswalks.geojson: GeoJSON file containing the refined crosswalks
     """
     import time
+    import uuid
 
     import geopandas as gpd
     from shapely.ops import unary_union
@@ -320,7 +335,7 @@ def grow_cut(
         crosswalks_path = city_path
         output_path = city_path
     else:
-        masks_path = "/geofiles/train_9/geofiles"
+        masks_path = "/geofiles/train_10/geofiles"
         crosswalks_path = "/scratch"
         output_path = crosswalks_path
 
@@ -343,6 +358,12 @@ def grow_cut(
         f"{crosswalks_path}/crosswalk_edges_{version_in}.shp"
     ).to_crs("EPSG:3857")
 
+    # Preprocess crosswalk geometries: normalize, drop duplicates, and assign unique UUIDs to null osmids
+    crosswalks["geometry"] = crosswalks["geometry"].apply(lambda g: g.normalize())
+    crosswalks = crosswalks.drop_duplicates(subset=["geometry"])
+    null_mask = crosswalks["osmid"].isna()
+    crosswalks.loc[null_mask, "osmid"] = [uuid.uuid4() for _ in range(null_mask.sum())]
+
     logger.info(
         f"Found {len(crosswalks)} crosswalks to refine. Matching to intersections..."
     )
@@ -358,6 +379,7 @@ def grow_cut(
             on="index_right",
         )
     )
+    logger.debug(crosswalks_to_intersections.info())
     # Deduplicate on the index by unary unioning all crosswalk_polygons for that (left) index
     crosswalks_to_intersections = crosswalks_to_intersections.groupby("osmid").agg(
         {

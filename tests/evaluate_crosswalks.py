@@ -94,7 +94,7 @@ def plot_length_histograms(
         color="#4DFFFC",
         label=after_name,
     )
-    plt.xscale("log")
+    # plt.xscale("log")
     plt.xlabel("Length (feet)")
     plt.ylabel("Frequency")
     plt.title("Crosswalk Length Distribution")
@@ -210,11 +210,13 @@ def main():
 
     # Calculate statistics
     print(f"\nStatistics for {args.before}:")
+    print(f"Number of crosswalks: {len(before_gdf)}")
     print(f"Mean: {before_lengths.mean():.2f} feet")
     print(f"Median: {before_lengths.median():.2f} feet")
     print(f"Standard Deviation: {before_lengths.std():.2f} feet")
 
     print(f"\nStatistics for {args.after}:")
+    print(f"Number of crosswalks: {len(after_gdf)}")
     print(f"Mean: {after_lengths.mean():.2f} feet")
     print(f"Median: {after_lengths.median():.2f} feet")
     print(f"Standard Deviation: {after_lengths.std():.2f} feet")

@@ -7,6 +7,8 @@ import json
 import math
 import pickle
 import random
+import glob
+import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Thread
 
@@ -25,6 +27,14 @@ from dotenv import load_dotenv
 from shapely.geometry import LineString, Polygon, box, MultiPolygon
 from shapely.ops import unary_union
 from shapely.validation import make_valid, explain_validity
+import pandas as pd
+from osmnx._errors import InsufficientResponseError as OSMnxInsufficientResponseError
+
+# Set OSMnx network timeout globally
+import logging
+ox.settings.log_console = True
+ox.settings.log_level = logging.DEBUG
+ox.settings.requests_timeout = 600
 
 load_dotenv()
 
@@ -44,39 +54,40 @@ from utils import (
 # Configuration constants
 # ===================================================================================================
 # Environment setup
-ENV_NAME = os.environ.get('MODAL_ENVIRONMENT', 'local')
-CITY_CODE = os.getenv("CITY_CODE")
+ENV_NAME = os.environ.get('MODAL_ENVIRONMENT', 'local') # Defines the environment (e.g., specific city for Modal, or 'local')
+CITY_CODE = os.getenv("CITY_CODE") # Specific city code, often used for data paths and filtering
 
 # Volume naming
-INPUTS_VOLUME_NAME = f"crosswalk-data-{ENV_NAME}"
-OUTPUTS_VOLUME_NAME = f"{INPUTS_VOLUME_NAME}-results"
+INPUTS_VOLUME_NAME = f"crosswalk-data-{CITY_CODE}" # Name of the Modal Volume for input image data
+OUTPUTS_VOLUME_NAME = f"{INPUTS_VOLUME_NAME}-results" # Name of the Modal Volume for storing results
 
 # File paths
-CITY_CODE_MAPPING_CSV_PATH = "data/city_code_mapping.csv"
+CITY_CODE_MAPPING_CSV_PATH = "data/city_code_mapping.csv" # Path to the CSV mapping city codes to OSM place names
 
 # Image processing
-IMAGE_SIZE = 1024
-CV2_STRUCTURING_ELEMENT = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
+IMAGE_SIZE = 1024 # Target size (width and height) for resizing input images before SAM processing
+CV2_STRUCTURING_ELEMENT = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3)) # Structuring element for morphological operations
 
 # SAM2 model configuration
+# Dictionary of parameters for the SAM2AutomaticMaskGenerator
 MASK_GENERATOR_CONFIG = {
-    "points_per_side": 16,
-    "pred_iou_thresh": 0.86,
-    "stability_score_thresh": 0.91,
-    "crop_n_layers": 1,
-    "min_mask_region_area": 500,
-    "points_per_batch": 512,
-    "box_nms_thresh": 0.78,
-    "crop_overlap_ratio": 0.66,
-    "crop_n_points_downscale_factor": 2, 
-    "output_mode": "binary_mask"
+    "points_per_side": 16,          # Number of points to sample along each side of the image
+    "pred_iou_thresh": 0.86,        # Prediction IoU threshold for filtering masks
+    "stability_score_thresh": 0.91, # Stability score threshold for filtering masks
+    "crop_n_layers": 1,             # Number of layers for multi-level cropping
+    "min_mask_region_area": 500,    # Minimum area of a mask region to be considered
+    "points_per_batch": 512,        # Number of points to process in a batch
+    "box_nms_thresh": 0.78,         # Box NMS threshold for suppressing overlapping boxes
+    "crop_overlap_ratio": 0.66,     # Overlap ratio for cropped regions
+    "crop_n_points_downscale_factor": 2, # Downscale factor for points in cropped regions
+    "output_mode": "binary_mask"    # Output mode for the mask generator (e.g., binary_mask, uncompressed_rle)
 }
 
 # Filtering parameters
-MAX_RELATIVE_OVERLAP = 0.05
-MAX_ABSOLUTE_OVERLAP = 10.0  # meters²
-MIN_CROSSWALK_AREA = 5.0     # meters²
-OSM_BUFFER_METERS = 1.5
+MAX_RELATIVE_OVERLAP = 0.2   # Maximum relative overlap allowed between a SAM mask and OSM drivable areas
+MAX_ABSOLUTE_OVERLAP = 15.0  # meters² - Maximum absolute overlap (in square meters) allowed with OSM drivable areas
+MIN_CROSSWALK_AREA = 5.0     # meters² - Minimum real-world area for a mask to be considered a valid crosswalk
+MAX_OVERLAP_PERCENT = 10.0   # Maximum allowed SAM overlap percentage for a building footprint to be included in fallback
 
 # Modal setup
 # ===================================================================================================
@@ -85,7 +96,15 @@ app = modal.App(name="crossing-distance-sam2-inference")
 
 # Configure Modal image
 infer_image = (
-    modal.Image.debian_slim(python_version="3.11")
+    modal.Image.from_registry("nvidia/cuda:12.8.1-cudnn-devel-ubuntu20.04", add_python="3.11")
+    .env({
+        "DEBIAN_FRONTEND": "noninteractive",
+        "CXX": "g++",
+        "CC": "gcc",
+        "TORCH_CUDA_ARCH_LIST": "8.0;8.6;9.0", 
+        "FORCE_CUDA": "1",
+        "CUDA_HOME": "/usr/local/cuda"
+    })
     .apt_install(
         "git", 
         "wget", 
@@ -96,16 +115,8 @@ infer_image = (
         "g++", 
         "libgl1-mesa-glx"
     )
-    .env({
-        "DEBIAN_FRONTEND": "noninteractive",
-        "CXX": "g++",
-        "CC": "gcc",
-        "TORCH_CUDA_ARCH_LIST": "8.0;8.6;9.0", 
-        "FORCE_CUDA": "1",
-        "CUDA_HOME": "/usr/local/cuda"
-    })
     .pip_install("numpy")
-    .run_commands("pip install torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 --index-url https://download.pytorch.org/whl/cu121")
+    .run_commands("pip install torch torchvision torchaudio")
     .pip_install(
         "opencv-python==4.10.0.84",
         "pycocotools~=2.0.8",
@@ -132,11 +143,9 @@ infer_image = (
         "echo $PATH",
         "echo $LD_LIBRARY_PATH",
     )
-    # Add local Python modules explicitly
     .add_local_python_source("utils")
     .add_local_python_source("sam2")
     .add_local_python_source("_remote_module_non_scriptable")
-    # Add local mapping data directory
     .add_local_dir("../data/mapping", remote_path="/data")
 )
 
@@ -463,13 +472,19 @@ class DataLoader:
                 reader = csv.DictReader(csvfile)
                 for row in reader:
                     city_code = row['Code'].lower()
-                    city_name = row['City']
+                    city_name = row['City'] if row['City'] else None
+                    county_name = row['County'] if row['County'] else None
                     state_name = row['State'] if row['State'] else None # Handle empty state
                     country_name = row['Country']
 
-                    place_dict = {'city': city_name, 'country': country_name} # Base dict
+                    place_dict = {'country': country_name} # Base dict
+                    if city_name: # Add city only if it's not empty
+                        place_dict['city'] = city_name
+                    if county_name: # Add county only if it's not empty
+                        place_dict['county'] = county_name
                     if state_name: # Add state only if it's not empty
                         place_dict['state'] = state_name
+                    
 
                     city_code_to_place_mapping[city_code] = place_dict
             print(f"City code mapping loaded from CSV: {csv_filepath}")
@@ -487,6 +502,7 @@ class DataLoader:
         Loads city-wide OSM drivable edges and spatial index.
         Now includes caching for faster repeated lookups.
         """
+
         try:
             # First try to load from cache
             cache_dir = "/outputs/osm_cache"
@@ -537,7 +553,91 @@ class DataLoader:
             city_edges_gdf = ox.features_from_place(place, tags=drivable_tags)
 
             # Get non-drivable area data
-            non_drivable_gdf = ox.features_from_place(place, tags=non_drivable_tags)
+            try:
+                non_drivable_gdf = ox.features_from_place(place, tags=non_drivable_tags)
+            except OSMnxInsufficientResponseError as e_main:
+                print(f"Warning: Main query for non-drivable features for {city_code} failed: {e_main}. Attempting subdivision...")
+                
+                # Get the polygon for the place to subdivide
+                try:
+                    place_gdf = ox.geocode_to_gdf(place)
+                    place_polygon = place_gdf.unary_union # Dissolve to a single polygon/multipolygon
+                except Exception as e_geocode:
+                    print(f"Error: Could not geocode place '{place}' for subdivision: {e_geocode}. Non-drivable features will be considered unloaded.")
+                    # If geocoding fails, subdivision is not possible. Re-raise the main error.
+                    raise e_main
+
+                all_sub_gdfs = []
+                minx, miny, maxx, maxy = place_polygon.bounds
+                x_step = (maxx - minx) / 2 # Dividing into 2 parts along x-axis
+                y_step = (maxy - miny) / 2 # Dividing into 2 parts along y-axis
+
+                sub_polygons_to_query = []
+                for i in range(2): # 0, 1 for x-axis
+                    for j in range(2): # 0, 1 for y-axis
+                        # Create a bounding box for the sub-region
+                        sub_poly_bbox = box(minx + i * x_step, 
+                                            miny + j * y_step, 
+                                            minx + (i + 1) * x_step, 
+                                            miny + (j + 1) * y_step)
+                        # Only query sub-polygons that actually intersect the main place_polygon
+                        # and ensure the intersection itself is a valid Polygon or MultiPolygon (not empty or just a line)
+                        intersection_with_place = sub_poly_bbox.intersection(place_polygon)
+                        if not intersection_with_place.is_empty and isinstance(intersection_with_place, (Polygon, MultiPolygon)):
+                            sub_polygons_to_query.append(intersection_with_place)
+                
+                if not sub_polygons_to_query:
+                    print(f"Warning: No valid intersecting sub-polygons created for {city_code} after attempting to subdivide. Re-raising original error.")
+                    raise e_main
+
+                print(f"Querying {len(sub_polygons_to_query)} sub-regions for non-drivable features in {city_code}...")
+                sub_queries_failed_count = 0
+                successful_sub_queries = 0
+                for idx, sub_poly_geom in enumerate(sub_polygons_to_query):
+                    try:
+                        print(f"  Querying sub-region {idx+1}/{len(sub_polygons_to_query)}...")
+                        # Use the actual intersection geometry for the query
+                        sub_gdf = ox.features_from_polygon(sub_poly_geom, tags=non_drivable_tags)
+                        if not sub_gdf.empty:
+                            all_sub_gdfs.append(sub_gdf)
+                            successful_sub_queries +=1
+                            print(f"    Found {len(sub_gdf)} features in sub-region {idx+1}.")
+                        else:
+                            print(f"    No features found in sub-region {idx+1}.")
+                    except ox._errors.InsufficientResponseError as e_sub:
+                        print(f"    Warning: Sub-query {idx+1} for {city_code} failed (Overpass API error): {e_sub}. Skipping this sub-region.")
+                        sub_queries_failed_count += 1
+                    except Exception as e_sub_other:
+                        print(f"    Warning: Unexpected error in sub-query {idx+1} for {city_code}: {e_sub_other}. Skipping this sub-region.")
+                        sub_queries_failed_count += 1
+                
+                if all_sub_gdfs:
+                    print(f"Concatenating features from {len(all_sub_gdfs)} successful sub-queries ({successful_sub_queries} out of {len(sub_polygons_to_query)}).")
+                    non_drivable_gdf = pd.concat(all_sub_gdfs, ignore_index=True)
+                    if 'element_type' in non_drivable_gdf.columns and 'osmid' in non_drivable_gdf.columns:
+                        # Keep track of original count before dropping duplicates
+                        original_feature_count = len(non_drivable_gdf)
+                        non_drivable_gdf = non_drivable_gdf.drop_duplicates(subset=['element_type', 'osmid'], keep='first')
+                        deduplicated_count = len(non_drivable_gdf)
+                        print(f"    Deduplicated features from {original_feature_count} to {deduplicated_count}.")
+                    else: # Fallback if osmid or element_type not present, though unlikely for OSMnx features
+                        print("    Warning: 'element_type' or 'osmid' not in columns, cannot deduplicate precisely.")
+                    print(f"Total {len(non_drivable_gdf)} non-drivable features after subdivision and concatenation.")
+                elif sub_queries_failed_count == len(sub_polygons_to_query) and not all_sub_gdfs: # All sub-queries failed
+                    print(f"Error: All {len(sub_polygons_to_query)} sub-queries for non-drivable features failed for {city_code}. Re-raising original error from main query.")
+                    raise e_main 
+                else: # Some sub-queries might have succeeded but returned no data, or some failed but others succeeded with no data.
+                    print(f"Warning: No non-drivable features collected after subdivision for {city_code}. This might be due to all successful sub-queries returning no features, or a mix of failures and no-data successes. Non-drivable GDF will be empty.")
+                    non_drivable_gdf = gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+
+            except Exception as e_other_initial: 
+                # This catches other errors from the *initial* ox.features_from_place(place, ...) call,
+                # or if e_main was re-raised from the subdivision block.
+                print(f"Error: Failed to retrieve non-drivable features for {city_code} due to: {e_other_initial}. Non-drivable features will be considered unloaded.")
+                # To ensure the script exits as per user requirement, we must re-raise the error.
+                # Or, ensure non_drivable_gdf is in a state that run_inference() will treat as a failure.
+                # The most direct way to ensure failure is to re-raise.
+                raise e_other_initial
 
             # Verification and enforcement of CRS
             if city_edges_gdf.crs is None:
@@ -593,16 +693,32 @@ class DataLoader:
             city_edges_sindex = city_edges_gdf.sindex
             
             # Filter non-drivable areas (only keep buildings, parks, etc.)
-            non_drivable_gdf = non_drivable_gdf[
-                (non_drivable_gdf['building'].notna()) | 
-                (non_drivable_gdf['amenity'].isin(['parking'])) |
-                (non_drivable_gdf['parking'].isin(['surface'])) |
-                (non_drivable_gdf['leisure'].isin(['park', 'stadium', 'miniature_golf', 'pitch', 'playground'])) |
-                (non_drivable_gdf['landuse'].isin(['grass', 'brownfield'])) |
-                (non_drivable_gdf['surface'].isin(['grass'])) |
-                (non_drivable_gdf['place'].isin(['square']))
-            ]
-            
+            filter_conditions = []
+
+            # Check if each column exists before filtering on it
+            if 'building' in non_drivable_gdf.columns:
+                filter_conditions.append(non_drivable_gdf['building'].notna())
+            if 'amenity' in non_drivable_gdf.columns:
+                filter_conditions.append(non_drivable_gdf['amenity'].isin(['parking']))
+            if 'parking' in non_drivable_gdf.columns:
+                filter_conditions.append(non_drivable_gdf['parking'].isin(['surface']))
+            if 'leisure' in non_drivable_gdf.columns:
+                filter_conditions.append(non_drivable_gdf['leisure'].isin(['park', 'stadium', 'miniature_golf', 'pitch', 'playground']))
+            if 'landuse' in non_drivable_gdf.columns:
+                filter_conditions.append(non_drivable_gdf['landuse'].isin(['grass', 'brownfield']))
+            if 'surface' in non_drivable_gdf.columns:
+                filter_conditions.append(non_drivable_gdf['surface'].isin(['grass']))
+            if 'place' in non_drivable_gdf.columns:
+                filter_conditions.append(non_drivable_gdf['place'].isin(['square']))
+
+            # Only apply filtering if there are conditions
+            if filter_conditions:
+                mask = np.logical_or.reduce(filter_conditions)
+                non_drivable_gdf = non_drivable_gdf[mask]
+            else:
+                # If none of the columns exist, return an empty GeoDataFrame
+                non_drivable_gdf = gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+
             # Create spatial index for non-drivable areas
             non_drivable_sindex = non_drivable_gdf.sindex
             
@@ -647,38 +763,75 @@ data_loader = DataLoader()
 
 class OSMProcessor:
     """Class to handle OSM data processing and manipulation"""
+
+    HIGHWAY_BUFFER_MAPPING = {
+        # Wider Roads
+        'primary': 2.0,
+        'primary_link': 1.7,
+        'secondary': 1.7,
+        'secondary_link': 1.5,
+        # Medium Roads (Baseline)
+        'tertiary': 1.5,
+        # Narrower Roads
+        'tertiary_link': 1.2,
+        'unclassified': 1.2,
+        'residential': 1.2,
+        # Default for any other types or if tag is missing/unexpected
+        '_default_': 1.2
+    }
     
+    QUERY_EXPANSION_METERS = 5.0 
+
     @staticmethod
     def get_osm_drivable_edges(bbox_polygon, city_edges_gdf, city_edges_sindex):
-        """Get drivable edges from OSM within a bounding box"""
-        buffered_distance = OSM_BUFFER_METERS
+        """Get drivable edges from OSM within a bounding box with dynamic buffering."""
         
-        # Get UTM CRS for this bbox
         centroid = bbox_polygon.centroid
         utm_crs = get_utm_projection(centroid.x, centroid.y)
         
-        # Convert and buffer in UTM
-        bbox_utm = gpd.GeoSeries([bbox_polygon], crs="EPSG:4326").to_crs(utm_crs)
-        buffered_bbox_utm = bbox_utm.buffer(buffered_distance).iloc[0]
-        buffered_bbox_polygon = gpd.GeoSeries([buffered_bbox_utm], crs=utm_crs).to_crs("EPSG:4326").iloc[0]
+        bbox_utm_ser = gpd.GeoSeries([bbox_polygon], crs="EPSG:4326").to_crs(utm_crs)
+        expanded_bbox_utm = bbox_utm_ser.buffer(OSMProcessor.QUERY_EXPANSION_METERS).iloc[0]
+        expanded_bbox_for_query_wgs84 = gpd.GeoSeries([expanded_bbox_utm], crs=utm_crs).to_crs("EPSG:4326").iloc[0]
 
-        # Query OSM data
-        possible_matches_index = list(city_edges_sindex.intersection(buffered_bbox_polygon.bounds))
+        possible_matches_index = list(city_edges_sindex.intersection(expanded_bbox_for_query_wgs84.bounds))
         possible_matches = city_edges_gdf.iloc[possible_matches_index]
         
         precise_matches = possible_matches[possible_matches.intersects(bbox_polygon)]
         
-        # Buffer OSM edges in UTM
+        original_osm_edges = precise_matches['geometry'].tolist() 
+        buffered_osm_edges_final_wgs84 = []
+
         if not precise_matches.empty:
-            precise_matches_utm = precise_matches.to_crs(utm_crs)
-            buffered_matches_utm = precise_matches_utm.copy()
-            buffered_matches_utm['geometry'] = buffered_matches_utm.geometry.buffer(buffered_distance)
-            buffered_matches = buffered_matches_utm.to_crs("EPSG:4326")
-            buffered_osm_edges = buffered_matches['geometry'].tolist()
-        else:
-            buffered_osm_edges = []
-        
-        return precise_matches['geometry'].tolist(), buffered_osm_edges
+            precise_matches_utm = precise_matches.to_crs(utm_crs) 
+            
+            buffered_geometries_in_utm_list = []
+            for index, row in precise_matches_utm.iterrows():
+                highway_tag_value = row.get('highway') 
+                
+                lookup_key = '_default_' 
+                if isinstance(highway_tag_value, str):
+                    lookup_key = highway_tag_value
+                elif isinstance(highway_tag_value, list) and highway_tag_value:
+                    first_element = highway_tag_value[0]
+                    if isinstance(first_element, str):
+                        lookup_key = first_element
+
+                buffer_width_meters = OSMProcessor.HIGHWAY_BUFFER_MAPPING.get(
+                    lookup_key, 
+                    OSMProcessor.HIGHWAY_BUFFER_MAPPING['_default_'] 
+                )
+                
+                if row.geometry and not row.geometry.is_empty:
+                    buffered_geom = row.geometry.buffer(buffer_width_meters)
+                    if not buffered_geom.is_empty:
+                        buffered_geometries_in_utm_list.append(buffered_geom)
+            
+            if buffered_geometries_in_utm_list:
+                buffered_geoms_utm_gs = gpd.GeoSeries(buffered_geometries_in_utm_list, crs=utm_crs)
+                buffered_geoms_wgs84_gs = buffered_geoms_utm_gs.to_crs("EPSG:4326")
+                buffered_osm_edges_final_wgs84 = [geom for geom in buffered_geoms_wgs84_gs if not geom.is_empty]
+    
+        return original_osm_edges, buffered_osm_edges_final_wgs84
 
     @staticmethod
     def get_osm_non_drivable_features(bbox_polygon, non_drivable_gdf, non_drivable_sindex):
@@ -686,49 +839,62 @@ class OSMProcessor:
         if non_drivable_gdf.empty or non_drivable_sindex is None:
             return []
             
-        # Define buffer distance for building footprints
-        buffer_distance = 0.5  # 0.5 meters (smaller than road buffer)
+        buffer_distance = 0.5
         
-        # Get UTM CRS for this bbox
         centroid = bbox_polygon.centroid
         utm_crs = get_utm_projection(centroid.x, centroid.y)
         
-        # Query OSM data using spatial index
         possible_matches_index = list(non_drivable_sindex.intersection(bbox_polygon.bounds))
         possible_matches = non_drivable_gdf.iloc[possible_matches_index]
         
-        # Get features that intersect with the bbox
         precise_matches = possible_matches[possible_matches.intersects(bbox_polygon)]
         
-        # Buffer building footprints slightly in UTM
+        non_drivable_features = []
         if not precise_matches.empty:
             precise_matches_utm = precise_matches.to_crs(utm_crs)
-            buffered_matches_utm = precise_matches_utm.copy()
-            buffered_matches_utm['geometry'] = buffered_matches_utm.geometry.buffer(buffer_distance)
-            buffered_matches = buffered_matches_utm.to_crs("EPSG:4326")
-            non_drivable_features = buffered_matches['geometry'].tolist()
-        else:
-            non_drivable_features = []
+            
+            buffered_geoms_utm_list = []
+            for geom in precise_matches_utm.geometry:
+                if geom and not geom.is_empty:
+                    buffered_geom = geom.buffer(buffer_distance)
+                    if buffered_geom and not buffered_geom.is_empty:
+                        buffered_geoms_utm_list.append(buffered_geom)
+            
+            if buffered_geoms_utm_list:
+                buffered_geoms_utm_gs = gpd.GeoSeries(buffered_geoms_utm_list, crs=utm_crs)
+                buffered_geoms_wgs84_gs = buffered_geoms_utm_gs.to_crs("EPSG:4326")
+                non_drivable_features = [g for g in buffered_geoms_wgs84_gs if g and not g.is_empty]
         
         return non_drivable_features
 
     @staticmethod
     def create_osm_mask(geometries, image_size, bbox, is_lines=False):
-        """Create binary mask of OSM edges in image coordinates with optimized processing."""
+        """Create binary mask of OSM edges in image coordinates (reverted to original logic)."""
         if not geometries:
             return np.zeros(image_size, dtype=np.uint8)
             
         osm_mask = np.zeros(image_size, dtype=np.uint8)
         width, height = image_size
         
-        # Precompute scale factors for coordinate conversion (once, not per-point)
-        x_scale = width / (bbox[0] - bbox[2])
+        # Original scale and offset calculations
+        # Assumes bbox is (min_lon, max_lat, max_lon, min_lat)
+        # Original x_scale was width / (bbox[0] - bbox[2]), which implies bbox[0] > bbox[2] for positive scale, or results in a flip.
+        # Original y_scale was height / (bbox[1] - bbox[3]), which implies bbox[1] > bbox[3] for positive scale.
+        # Original x_offset = bbox[2]
+        # Original y_offset = bbox[3]
+        
+        # To prevent division by zero if bbox[0] == bbox[2] or bbox[1] == bbox[3]
+        # These are signs of a degenerate bounding box.
+        if bbox[0] == bbox[2] or bbox[1] == bbox[3]:
+            print(f"Warning: Degenerate bounding box encountered in create_osm_mask (original logic): {bbox}")
+            return osm_mask # Return empty mask
+
+        x_scale = width / (bbox[0] - bbox[2]) 
         y_scale = height / (bbox[1] - bbox[3])
         x_offset = bbox[2]
         y_offset = bbox[3]
         
-        def transform_point(x, y):
-            """Fast coordinate transformation"""
+        def transform_point(x, y): # x is lon, y is lat
             pixel_x = int((x - x_offset) * x_scale)
             pixel_y = int((y - y_offset) * y_scale)
             return pixel_x, pixel_y
@@ -736,15 +902,13 @@ class OSMProcessor:
         def process_line(line):
             if line.is_empty:
                 return
-                
             coords = []
-            for x, y in line.coords:
-                pixel_x, pixel_y = transform_point(x, y)
+            for x_geo, y_geo in line.coords:
+                pixel_x, pixel_y = transform_point(x_geo, y_geo)
                 coords.append((pixel_x, pixel_y))
-                
             if len(coords) >= 2:
-                # Draw lines between consecutive points - use NumPy for vectorization
                 coords_array = np.array(coords, dtype=np.int32)
+                # Original: Draw lines between consecutive points individually
                 for i in range(len(coords_array) - 1):
                     cv2.line(osm_mask, 
                              (coords_array[i][0], coords_array[i][1]),
@@ -752,41 +916,39 @@ class OSMProcessor:
                              1, thickness=2)
         
         def process_polygon(polygon):
-            """Optimized polygon processing"""
             if polygon.is_empty:
+                 return
+            # Original area check threshold was 1e-9
+            if polygon.area < 1e-9: 
                 return
                 
-            # Skip small polygons
-            if polygon.area < 1e-9:
-                return
-                
-            # Convert exterior coordinates efficiently
-            coords = []
-            for x, y in polygon.exterior.coords:
-                pixel_x, pixel_y = transform_point(x, y)
-                coords.append((pixel_x, pixel_y))
+            ext_coords_pixel = []
+            for x_geo, y_geo in polygon.exterior.coords:
+                pixel_x, pixel_y = transform_point(x_geo, y_geo)
+                ext_coords_pixel.append((pixel_x, pixel_y))
             
-            if len(coords) > 2:
-                # Use int32 for better performance with OpenCV
-                cv2.fillPoly(osm_mask, [np.array(coords, dtype=np.int32)], 1)
+            if len(ext_coords_pixel) > 2:
+                cv2.fillPoly(osm_mask, [np.array(ext_coords_pixel, dtype=np.int32)], 1)
                 
-            # Also process interior holes for complex polygons
             for interior in polygon.interiors:
-                int_coords = []
-                for x, y in interior.coords:
-                    pixel_x, pixel_y = transform_point(x, y)
-                    int_coords.append((pixel_x, pixel_y))
-                    
-                if len(int_coords) > 2:
-                    cv2.fillPoly(osm_mask, [np.array(int_coords, dtype=np.int32)], 0)
+                int_coords_pixel = []
+                for x_geo, y_geo in interior.coords:
+                    pixel_x, pixel_y = transform_point(x_geo, y_geo)
+                    int_coords_pixel.append((pixel_x, pixel_y))
+                if len(int_coords_pixel) > 2:
+                    cv2.fillPoly(osm_mask, [np.array(int_coords_pixel, dtype=np.int32)], 0)
         
-        # Process geometries based on their type
+        # Original geometry processing loop structure
         for geom in geometries:
             if isinstance(geom, LineString):
-                process_line(geom)
+                # The original logic always processed LineStrings with process_line,
+                # regardless of is_lines flag in this specific loop.
+                # The is_lines flag in the function signature might have been intended for other uses
+                # or for how callers decide what geometries to pass.
+                process_line(geom) 
             elif isinstance(geom, MultiPolygon):
-                for polygon in geom.geoms:
-                    process_polygon(polygon)
+                for p in geom.geoms: # Using 'p' as in some earlier versions
+                    process_polygon(p)
             elif isinstance(geom, Polygon):
                 process_polygon(geom)
 
@@ -861,7 +1023,7 @@ class MaskProcessor:
         return coverage_percent < min_coverage_percent
     
     @staticmethod
-    def merge_masks_with_fallback(sam_mask, fallback_mask, image_size, osm_drivable_mask=None, max_overlap_percent=10.0):
+    def merge_masks_with_fallback(sam_mask, fallback_mask, image_size, osm_drivable_mask=None, max_overlap_percent=MAX_OVERLAP_PERCENT):
         """
         Merge SAM-generated masks with fallback OSM non-drivable feature masks.
         Prioritizes SAM masks over building footprints in areas where valid segmentation exists.
@@ -901,6 +1063,26 @@ class MaskProcessor:
         # Process each building individually
         retained_buildings_mask = np.zeros_like(fallback_mask)
         
+        # Define the building buffer in meters (5 feet ≈ 1.5 meters)
+        building_buffer_meters = 1.5  # 5 feet in meters
+        
+        # Extract width and height of the image to estimate pixel-to-meter conversion
+        width, height = image_size
+        
+        # Calculate approximate meters per pixel (assuming a typical aerial image)
+        # This is a rough approximation using the image diagonal
+        diagonal_pixels = np.sqrt(width**2 + height**2)
+        diagonal_meters = 50  # Rough estimate of diagonal coverage in meters
+        meters_per_pixel = diagonal_meters / diagonal_pixels
+        
+        # Convert buffer from meters to pixels
+        buffer_pixels = int(building_buffer_meters / meters_per_pixel)
+        
+        # Ensure buffer is at least 1 pixel
+        buffer_pixels = max(buffer_pixels, 5)  # Minimum 5 pixels for visibility
+        
+        print(f"Applying buffer of {buffer_pixels} pixels to accepted building footprints")
+        
         for contour in building_contours:
             # Create a mask for this individual building
             building_mask = np.zeros_like(fallback_mask)
@@ -930,8 +1112,13 @@ class MaskProcessor:
             
             # Only include buildings with little to no SAM mask overlap
             if overlap_percent <= max_overlap_percent:
-                # Accept this building as it has little to no overlap with SAM masks
-                retained_buildings_mask = cv2.bitwise_or(retained_buildings_mask, building_mask)
+                # Accept this building and apply buffer
+                buffered_building_mask = cv2.dilate(
+                    building_mask, 
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (buffer_pixels, buffer_pixels))
+                )
+                # Add the buffered building to our retained buildings mask
+                retained_buildings_mask = cv2.bitwise_or(retained_buildings_mask, buffered_building_mask)
         
         # Combine SAM mask with the retained buildings
         combined_mask = cv2.bitwise_or(combined_mask, retained_buildings_mask)
@@ -1067,13 +1254,19 @@ class GeometryProcessor:
                 return 0
         
         print(f"Processing {len(gdf)} geometries for export...")
+        initial_geometry_count = len(gdf)
+        print(f"Initial number of geometries for export: {initial_geometry_count}")
         
         # Filter small artifacts more efficiently
         gdf['area_m2'] = gdf.geometry.apply(get_utm_area)
-        gdf = gdf[gdf.area_m2 > 0.5]
+        print(f"Number of geometries after area calculation: {len(gdf)}")
+        # Disabled the area filter to retain all geometries during export
+        # gdf = gdf[gdf.area_m2 > 0.5]
+        # print(f"Number of geometries after area filter (if enabled): {len(gdf)}") # Add this if filter is re-enabled
         
         # Final simplification with tolerance optimized for visual quality
         gdf.geometry = gdf.geometry.simplify(0.000003, preserve_topology=True)
+        print(f"Number of geometries after final simplification: {len(gdf)}")
         
         # Create output directory
         os.makedirs(output_dir, exist_ok=True)
@@ -1083,20 +1276,69 @@ class GeometryProcessor:
         
         # Export concurrently
         futures = []
+
+        def export_file(gdf_to_export, final_filepath, driver_name, extension):
+            try:
+                # Ensure output directory exists (os.makedirs in export_geodata already does this)
+                # os.makedirs(os.path.dirname(final_filepath), exist_ok=True)
+
+                if extension == "shp":
+                    shp_output_dir = os.path.dirname(final_filepath)
+                    final_base_name = os.path.splitext(os.path.basename(final_filepath))[0]
+                    
+                    known_shp_extensions = [
+                        '.shp', '.shx', '.dbf', '.prj', '.cpg', '.sbn', '.sbx', '.xml',
+                        '.idx', '.fbn', '.fbx', '.atx', '.ixs', '.mxs' # Common shapefile extensions
+                    ]
+                    
+                    # Clean up all potential existing components first
+                    for shp_ext in known_shp_extensions:
+                        file_to_remove = os.path.join(shp_output_dir, f"{final_base_name}{shp_ext}")
+                        if os.path.exists(file_to_remove):
+                            try:
+                                os.remove(file_to_remove)
+                            except OSError: # Ignore minor issues
+                                pass 
+                    
+                    gdf_to_export.to_file(final_filepath, driver=driver_name)
+                    return f"Successfully exported {final_filepath} (and its components)"
+                
+                else: # For GeoJSON, KML, etc. (single file formats)
+                    if os.path.exists(final_filepath):
+                        try:
+                            os.remove(final_filepath)
+                        except OSError as e_remove:
+                            print(f"Warning: Could not remove existing file {final_filepath} before overwrite: {e_remove}")
+
+                    gdf_to_export.to_file(final_filepath, driver=driver_name)
+                    return f"Successfully exported {final_filepath}"
+
+            except Exception as e:
+                error_type_info = "(shapefile and its components)" if extension == "shp" else ""
+                if extension == "shp":
+                    shp_output_dir = os.path.dirname(final_filepath)
+                    final_base_name = os.path.splitext(os.path.basename(final_filepath))[0]
+                    known_shp_extensions = [
+                        '.shp', '.shx', '.dbf', '.prj', '.cpg', '.sbn', '.sbx', '.xml',
+                        '.idx', '.fbn', '.fbx', '.atx', '.ixs', '.mxs'
+                    ]
+                    for shp_ext in known_shp_extensions:
+                        file_to_clean = os.path.join(shp_output_dir, f"{final_base_name}{shp_ext}")
+                        if os.path.exists(file_to_clean):
+                            try: 
+                                os.remove(file_to_clean)
+                            except OSError: 
+                                pass 
+                
+                return f"Error exporting {final_filepath} {error_type_info}: {e}. Artifacts may exist if export was partial."
+
         for ext, driver in formats.items():
-            path = os.path.join(output_dir, f"cross_walks.{ext}")
-            print(f"Exporting to {path}...")
+            final_path = os.path.join(output_dir, f"cross_walks.{ext}")
+            # temp_path is no longer used or needed here
+            print(f"Exporting to {final_path}...")
             
-            # Use a function to capture loop variables
-            def export_file(gdf, path, driver):
-                try:
-                    gdf.to_file(path, driver=driver)
-                    return f"Successfully exported {path}"
-                except Exception as e:
-                    return f"Error exporting {path}: {e}"
-            
-            # Submit to thread pool
-            futures.append(io_executor.submit(export_file, gdf, path, driver))
+            # Pass final_path as the target path to the modified export function
+            futures.append(io_executor.submit(export_file, gdf.copy(), final_path, driver, ext))
         
         # Wait for all exports to complete
         for future in as_completed(futures):
@@ -1119,9 +1361,9 @@ geometry_processor = GeometryProcessor()
     image=infer_image, 
     gpu="L4",
     secrets=[modal.Secret.from_name("wandb-secret", environment_name="sam_test")],
-    timeout=36000
+    timeout=43200
 )
-def run_inference(model_path: str, mode: str, city_code: str, force: bool = False, rebuild_cache: bool = False, max_overlap_percent: float = 10.0):
+def run_inference(model_path: str, mode: str, city_code: str, rebuild_cache: bool = False):
     """
     Main inference function running on Modal.
     
@@ -1129,9 +1371,7 @@ def run_inference(model_path: str, mode: str, city_code: str, force: bool = Fals
         model_path: Path to the SAM2 model weights
         mode: Running mode ('test' or 'production')
         city_code: City code to process
-        force: Whether to force reprocessing of existing outputs
         rebuild_cache: Whether to force rebuild of the fuzzy search cache
-        max_overlap_percent: Maximum allowed SAM overlap percentage for building footprints (default: 10%)
     """
     
     # Set environment variables for optimization
@@ -1190,7 +1430,12 @@ def run_inference(model_path: str, mode: str, city_code: str, force: bool = Fals
 
     # Setup data directories
     input_set = os.listdir("/inputs")
-    output_dir = f"/outputs/{model_path}/images"
+
+    # Determine base output path based on mode
+    base_output_path_suffix = "test" if mode == "test" else ""
+    base_output_dir = os.path.join(f"/outputs/{model_path}", base_output_path_suffix)
+
+    output_dir = os.path.join(base_output_dir, "images")
     os.makedirs(output_dir, exist_ok=True)
     
     # Load city code mapping and OSM data
@@ -1250,11 +1495,11 @@ def run_inference(model_path: str, mode: str, city_code: str, force: bool = Fals
             "sam_stability_score_thresh": MASK_GENERATOR_CONFIG["stability_score_thresh"],
             "sam_min_mask_region_area": MASK_GENERATOR_CONFIG["min_mask_region_area"],
             
-            # OSM Filtering Parameters
-            "osm_buffer_meters": OSM_BUFFER_METERS,
+            # OSM Filtering Parameters (using constants for MAX_RELATIVE_OVERLAP etc.)
             "max_relative_overlap": MAX_RELATIVE_OVERLAP,
             "max_absolute_overlap": MAX_ABSOLUTE_OVERLAP,
             "min_crosswalk_area": MIN_CROSSWALK_AREA,
+            "query_expansion_meters": OSMProcessor.QUERY_EXPANSION_METERS, # Log the query expansion
             
             # Fallback Parameters
             "use_building_fallback": True,
@@ -1281,14 +1526,43 @@ def run_inference(model_path: str, mode: str, city_code: str, force: bool = Fals
             "osm_method": "spatial_index",
             "city_mapping_source": "city_code_mapping.csv",
             "platform": "modal-L4",
-            "force_processing": force,
-            "max_overlap_percent": max_overlap_percent
+            "max_overlap_percent": MAX_OVERLAP_PERCENT
         }
     )
 
     print(f"Total images to check: {len(input_set)}")
-    shapefile_data = []
     
+    # --- Checkpointing Setup ---
+    CHECKPOINT_INTERVAL = 100 # Save every 100 images
+    checkpoint_dir = os.path.join(base_output_dir, "geofile_checkpoints")
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    shapefile_data = []
+    processed_image_names = set() # To avoid duplicates when loading checkpoints
+
+    # Load existing checkpoints
+    initial_checkpoint_files_for_counter = [] # Used to set the batch counter correctly
+
+    # Always try to load checkpoints
+    checkpoint_files_to_load = sorted(glob.glob(os.path.join(checkpoint_dir, "checkpoint_batch_*.pkl")))
+    initial_checkpoint_files_for_counter = checkpoint_files_to_load # Store for counter init
+    if checkpoint_files_to_load:
+        print(f"Found {len(checkpoint_files_to_load)} existing checkpoint files. Loading data...")
+        for cp_file in checkpoint_files_to_load:
+            try:
+                with open(cp_file, 'rb') as f:
+                    batch_data = pickle.load(f)
+                    for item in batch_data:
+                        if item['image_name'] not in processed_image_names:
+                            shapefile_data.append(item)
+                            processed_image_names.add(item['image_name'])
+                print(f"Loaded {len(batch_data)} items from {cp_file}")
+            except Exception as e:
+                print(f"Error loading checkpoint file {cp_file}: {e}")
+        print(f"Loaded a total of {len(shapefile_data)} items from checkpoints.")
+    else:
+        print("No existing checkpoint files found to load. Starting fresh run for this model/mode/city combination.")
+    # --- End Checkpointing Setup ---
+
     # Set up counters for tracking
     processed_count = 0
     skipped_count = 0
@@ -1298,18 +1572,21 @@ def run_inference(model_path: str, mode: str, city_code: str, force: bool = Fals
     collected_images = [] if mode == "test" else None
     
     # Main processing loop
+    current_batch_data = [] # For periodic checkpointing
+    checkpoint_batch_counter = len(initial_checkpoint_files_for_counter) # Start batch counter
+
     for image_file in input_set:
         print(f"Processing: {image_file}")
         image_name = os.path.splitext(image_file)[0].split("/")[-1]
         image_path = os.path.join("/inputs", image_file)
         
-        # Check if output already exists - skip this check in test mode for consistency
-        output_path = os.path.join(output_dir, f"{image_name}_masked.jpg")
-        if mode != "test" and not force and os.path.exists(output_path):
-            print(f"Output already exists for {image_name}, skipping (use --force to override)")
+        # Check if image was already processed and its geometry loaded from checkpoint
+        output_path = os.path.join(output_dir, f"{image_name}_masked.jpg") # Still need output_path for saving later
+        if image_name in processed_image_names:
+            print(f"Image {image_name} has its geometry loaded from checkpoint, skipping full processing.")
             skipped_count += 1
-            continue
-            
+            continue # Skip to next image
+
         # Get bounding box from filename
         bbox = bounding_box_from_filename(image_name)
         
@@ -1415,9 +1692,6 @@ def run_inference(model_path: str, mode: str, city_code: str, force: bool = Fals
         # Create a downscaled version of the sam_mask for visualization
         downscaled_sam_mask = cv2.resize(sam_mask, (IMAGE_SIZE, IMAGE_SIZE), interpolation=cv2.INTER_NEAREST)
         
-        # Define the maximum overlap percentage (same as in merge_masks_with_fallback)
-        max_overlap_percent = 10.0
-        
         # Extract individual building contours for visualization
         building_contours, _ = cv2.findContours(
             non_drivable_mask.astype(np.uint8), 
@@ -1425,10 +1699,19 @@ def run_inference(model_path: str, mode: str, city_code: str, force: bool = Fals
             cv2.CHAIN_APPROX_SIMPLE
         )
         
+        # Calculate buffer size for visualization (same as in merge_masks_with_fallback)
+        building_buffer_meters = 1.5  # 5 feet in meters
+        width, height = IMAGE_SIZE, IMAGE_SIZE
+        diagonal_pixels = np.sqrt(width**2 + height**2)
+        diagonal_meters = 50  # Rough estimate of diagonal coverage in meters
+        meters_per_pixel = diagonal_meters / diagonal_pixels
+        buffer_pixels = int(building_buffer_meters / meters_per_pixel)
+        buffer_pixels = max(buffer_pixels, 5)  # Minimum 5 pixels for visibility
+        
         # Process each building polygon individually for visualization
         standalone_buildings_mask = np.zeros_like(non_drivable_mask)
-        overlapping_buildings_mask = np.zeros_like(non_drivable_mask)
-        road_overlapping_buildings_mask = np.zeros_like(non_drivable_mask)
+        excluded_buildings_mask = np.zeros_like(non_drivable_mask)
+        buffered_buildings_mask = np.zeros_like(non_drivable_mask)  # For visualization with buffer
         
         for contour in building_contours:
             # Create a mask for this individual building
@@ -1450,42 +1733,37 @@ def run_inference(model_path: str, mode: str, city_code: str, force: bool = Fals
             if building_pixels > 0:
                 sam_overlap_percent = (sam_overlap_pixels / building_pixels) * 100
             
-            if road_overlap_percent > 5.0:
-                # Building overlaps with roads
-                road_overlapping_buildings_mask = cv2.bitwise_or(road_overlapping_buildings_mask, building_mask)
-            elif sam_overlap_percent <= max_overlap_percent:
-                # Standalone building with little to no SAM overlap - will be used
-                standalone_buildings_mask = cv2.bitwise_or(standalone_buildings_mask, building_mask)
+            if road_overlap_percent > 5.0 or sam_overlap_percent > MAX_OVERLAP_PERCENT:
+                # Building is excluded either due to road overlap or SAM overlap
+                excluded_buildings_mask = cv2.bitwise_or(excluded_buildings_mask, building_mask)
             else:
-                # Building overlaps significantly with SAM masks - won't be used
-                overlapping_buildings_mask = cv2.bitwise_or(overlapping_buildings_mask, building_mask)
+                # Standalone building with little to no overlap - will be used
+                standalone_buildings_mask = cv2.bitwise_or(standalone_buildings_mask, building_mask)
+                
+                # Apply the same buffer used in merge_masks_with_fallback for visualization
+                buffered_building_mask = cv2.dilate(
+                    building_mask, 
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (buffer_pixels, buffer_pixels))
+                )
+                buffered_buildings_mask = cv2.bitwise_or(buffered_buildings_mask, buffered_building_mask)
         
-        # Update the visualization with the categorized building masks
-        # 1. All building footprints (thin, light magenta outline for context)
-        all_building_contours, _ = cv2.findContours(
-            non_drivable_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cv2.drawContours(annotated, all_building_contours, -1, (180, 100, 180), 1)  # Light magenta, thin
-        
-        # 2. Buildings that overlap with roads (yellow)
-        if np.any(road_overlapping_buildings_mask):
-            road_overlap_contours, _ = cv2.findContours(
-                road_overlapping_buildings_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            cv2.drawContours(annotated, road_overlap_contours, -1, (255, 255, 0), 2)  # Yellow
-            print(f"Buildings with road overlap: {np.count_nonzero(road_overlapping_buildings_mask)} pixels")
-        
-        # 3. Buildings that overlap with SAM masks (orange) - these won't be used
-        if np.any(overlapping_buildings_mask):
-            sam_overlap_contours, _ = cv2.findContours(
-                overlapping_buildings_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            cv2.drawContours(annotated, sam_overlap_contours, -1, (255, 165, 0), 2)  # Orange
-            print(f"Buildings with significant SAM overlap (excluded): {np.count_nonzero(overlapping_buildings_mask)} pixels")
+        # 1. Excluded buildings that won't be used (orange) - includes both road overlaps and SAM overlaps
+        if np.any(excluded_buildings_mask):
+            excluded_contours, _ = cv2.findContours(
+                excluded_buildings_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(annotated, excluded_contours, -1, (255, 165, 0), 2)  # Orange
             
-        # 4. Standalone buildings with little to no SAM overlap (bright cyan) - these will be used
+        # 2. Standalone buildings original footprints (thin magenta)
         if np.any(standalone_buildings_mask):
             standalone_contours, _ = cv2.findContours(
                 standalone_buildings_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            cv2.drawContours(annotated, standalone_contours, -1, (0, 255, 255), 2)  # Cyan, thicker
-            print(f"Standalone buildings used in final mask: {np.count_nonzero(standalone_buildings_mask)} pixels")
+            cv2.drawContours(annotated, standalone_contours, -1, (180, 100, 180), 1)  # Thin magenta
+            
+        # 3. Buffered buildings that will be used (bright cyan) - shows the actual buffer applied
+        if np.any(buffered_buildings_mask):
+            buffered_contours, _ = cv2.findContours(
+                buffered_buildings_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(annotated, buffered_contours, -1, (0, 255, 255), 2)  # Cyan, thicker
         
         # Save the annotated image
         async_write(output_path, rgb_to_bgr(annotated))
@@ -1507,7 +1785,7 @@ def run_inference(model_path: str, mode: str, city_code: str, force: bool = Fals
             resized_non_drivable_mask, 
             original_size,
             osm_drivable_mask=resized_osm_drivable_mask,
-            max_overlap_percent=max_overlap_percent
+            max_overlap_percent=MAX_OVERLAP_PERCENT
         )
         
         # Log metrics
@@ -1583,10 +1861,40 @@ def run_inference(model_path: str, mode: str, city_code: str, force: bool = Fals
             "image_name": image_name,
             "geometry": inverse_geometry
         })
+        current_batch_data.append({
+            "image_name": image_name,
+            "geometry": inverse_geometry
+        })
+        processed_image_names.add(image_name) # Add to set of processed names
         
         print(f"Image: {image_name}")
         print(f"Contours found: {len(contours)}")
         print(f"Valid polygons: {len(valid_polys) if 'valid_polys' in locals() else 0}")
+
+        # --- Periodic Checkpointing --- 
+        if len(current_batch_data) >= CHECKPOINT_INTERVAL:
+            checkpoint_file_path = os.path.join(checkpoint_dir, f"checkpoint_batch_{checkpoint_batch_counter}.pkl")
+            try:
+                with open(checkpoint_file_path, 'wb') as f:
+                    pickle.dump(current_batch_data, f)
+                print(f"Saved checkpoint with {len(current_batch_data)} items to {checkpoint_file_path}")
+                current_batch_data = [] # Reset batch
+                checkpoint_batch_counter += 1
+            except Exception as e:
+                print(f"Error saving checkpoint: {e}")
+        # --- End Periodic Checkpointing ---
+
+    # --- Final Checkpoint for remaining data ---
+    if current_batch_data: # Save any remaining data
+        checkpoint_file_path = os.path.join(checkpoint_dir, f"checkpoint_batch_{checkpoint_batch_counter}.pkl")
+        try:
+            with open(checkpoint_file_path, 'wb') as f:
+                pickle.dump(current_batch_data, f)
+            print(f"Saved final checkpoint with {len(current_batch_data)} items to {checkpoint_file_path}")
+            checkpoint_batch_counter += 1
+        except Exception as e:
+            print(f"Error saving final checkpoint: {e}")
+    # --- End Final Checkpoint ---
 
     # Print summary
     print("\nProcessing Summary:")
@@ -1603,7 +1911,8 @@ def run_inference(model_path: str, mode: str, city_code: str, force: bool = Fals
         gc_collect()
         
         # Export data to files
-        GeometryProcessor.export_geodata(gdf, f"/outputs/{model_path}/geofiles")
+        geofiles_output_dir = os.path.join(base_output_dir, "geofiles")
+        GeometryProcessor.export_geodata(gdf, geofiles_output_dir)
     
     # Cleanup and shutdown executors
     io_executor.shutdown(wait=True)
@@ -1624,13 +1933,11 @@ def run_inference(model_path: str, mode: str, city_code: str, force: bool = Fals
 # Entry point for local execution
 # ===================================================================================================
 @app.local_entrypoint()
-def main(model: str, mode: str, force: bool = False, rebuild_cache: bool = False, max_overlap_percent: float = 10.0):
+def main(model: str, mode: str, rebuild_cache: bool = False):
     """Main entry point for local execution"""
     run_inference.remote(
         model_path=model,
         mode=mode,
         city_code=ENV_NAME,  # Use the same ENV_NAME from the top of the file
-        force=force,
-        rebuild_cache=rebuild_cache,
-        max_overlap_percent=max_overlap_percent
+        rebuild_cache=rebuild_cache
     )

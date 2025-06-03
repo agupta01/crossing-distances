@@ -15,7 +15,7 @@ TOLERANCE = 0.5  # metres – how far extended line may protrude beyond polygon 
 
 scratch_volume = modal.Volume.from_name("scratch", create_if_missing=True)
 geofiles_volume = modal.Volume.from_name(
-    f"crosswalk-data-{os.environ['MODAL_ENVIRONMENT'].lower() if os.environ['MODAL_ENVIRONMENT'].lower() != 'irv' else 'sna'}-results"
+    f"crosswalk-data-{os.environ['MODAL_ENVIRONMENT'].lower()}-results"
 )
 
 logger = create_logger()

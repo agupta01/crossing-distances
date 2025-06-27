@@ -1,13 +1,17 @@
 import os
 from concurrent.futures.thread import ThreadPoolExecutor
 
+import networkx as nx
 import modal
 import semver
-from shapely.geometry import LineString, MultiLineString, Polygon
+from shapely.prepared import prep
+from shapely.geometry import LineString, MultiLineString, Polygon, Point
 from tqdm import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
 
 from inference.utils import EPSILON, app, create_logger, osmnx_image
+from inference.osm_utils import compute_heading
+import geopandas as gpd
 
 GROW_RATE = 30
 RETRIES = 15
@@ -249,6 +253,99 @@ def get_line_spans_within_polygon(
     return cut_lines
 
 
+def merge_thickening_cleanup(crosswalks_gdf, lateral_buffer=2, heading_tol=10):
+    """Merges crosswalks if they are (a) within `lateral_buffer` meters of each other,
+    and (b) within `heading_tol` compass heading of each other. Merge consists of averaging
+    each group of endpoints for each group of crosswalks.
+
+    Args:
+        crosswalks_gdf (GeoDataFrame): EPSG:3857 dataframe with LineString geometry column
+        lateral_buffer (int, optional): Maximum distance between crosswalks to merge.
+            Defaults to 10.
+        heading_tol (int, optional): Maximum difference in compass heading between crosswalks to
+            merge. Defaults to 10.
+
+    Returns:
+        GeoDataFrame: EPSG:3857 dataframe with LineString geometry
+    """
+    # Ensure we're in EPSG:3857
+    if crosswalks_gdf.crs and not crosswalks_gdf.crs.is_projected:
+        print(
+            "Crosswalks GeoDataFrame must be projected to accurately compute intersections. Projecting to EPSG:3857..."
+        )
+        crosswalks_gdf = crosswalks_gdf.to_crs("EPSG:3857")
+
+    # Graph to find clusters
+    G = nx.Graph()
+    G.add_nodes_from(crosswalks_gdf.index)
+
+    crosswalks_gdf = crosswalks_gdf.assign(
+        _buffer=lambda x: x["geometry"].buffer(
+            lateral_buffer,
+            cap_style="flat",
+            join_style="bevel",
+        ),
+        _heading=lambda x: x["geometry"].apply(compute_heading),
+    )
+
+    # Create a spatial index for efficient intersection queries
+    sindex = crosswalks_gdf["_buffer"].sindex
+
+    # Normalize geometry
+    crosswalks_gdf["geometry"] = crosswalks_gdf["geometry"].normalize()
+
+    # Iterate over each feature to find possible matches
+    for idx in tqdm(crosswalks_gdf.index, total=len(crosswalks_gdf.index)):
+        geom = crosswalks_gdf.loc[idx, "_buffer"]
+        heading = crosswalks_gdf.loc[idx, "_heading"]
+        prepared_geom = prep(geom)
+
+        # Find candidate features via spatial index (bounding box intersection)
+        possible_matches_indices = list(sindex.intersection(geom.bounds))
+        possible_matches = crosswalks_gdf.iloc[possible_matches_indices]
+        possible_matches = possible_matches[
+            possible_matches.index != idx
+        ]  # Remove current edge
+
+        # Check if any of the possible matches are within the heading tolerance
+        for _, match in possible_matches.iterrows():
+            if abs(heading - match["_heading"]) <= heading_tol:
+                G.add_edge(idx, match.name)
+
+    # Find connected components
+    connected_components = list(nx.connected_components(G))
+
+    new_ids = []
+    new_crosswalks = []
+    for group in connected_components:
+        subgroup = crosswalks_gdf.loc[list(group)]
+        # Average each group of endpoints within subgroup
+        top_points = subgroup["geometry"].apply(lambda x: Point(x.coords[0]))
+        bottom_points = subgroup["geometry"].apply(lambda x: Point(x.coords[-1]))
+        avg_top_x, avg_top_y = top_points.x.mean(), top_points.y.mean()
+        avg_bottom_x, avg_bottom_y = bottom_points.x.mean(), bottom_points.y.mean()
+
+        # Create new crosswalk
+        new_crosswalk = LineString(
+            [(avg_top_x, avg_top_y), (avg_bottom_x, avg_bottom_y)]
+        )
+
+        # Unify ids of subgroup if needed by appending with _
+        if len(subgroup) > 1:
+            new_id = "_".join(subgroup.index.astype(str).tolist())
+        else:
+            new_id = subgroup.index.tolist()[0]
+
+        new_crosswalks.append(new_crosswalk)
+        new_ids.append(new_id)
+
+    return gpd.GeoDataFrame(
+        geometry=new_crosswalks,
+        crs="EPSG:3857",
+        index=new_ids,
+    )
+
+
 @app.function(image=osmnx_image)
 def compute_grow_cut(row):
     # Extract the row
@@ -306,13 +403,16 @@ def compute_grow_cut(row):
     cpu=4,
 )
 def grow_cut(
-    version_in: str = "2.0.0", version_out: str = f"2.1.3-grow{GROW_RATE}+{RETRIES}"
+    version_in: str = "2.0.0",
+    version_out: str = f"3.0.1",
+    use_backfill: bool = True,
 ):
     """Runs the grow-cut algorithm on the crosswalks to refine their boundaries.
 
     Arguments:
         version_in: The version of the crosswalk edges (SemVer). Defaults to 2.0.0.
-        version_out: The output version to set for this run (SemVer). Defaults to 2.0.2.
+        version_out: The output version to set for this run (SemVer). Defaults to 3.0.1.
+        use_backfill: Whether to use the backfilled masks. Defaults to True
 
     Inputs:
         cross_walks.geojson: GeoJSON file containing the crosswalk masks
@@ -335,7 +435,11 @@ def grow_cut(
         crosswalks_path = city_path
         output_path = city_path
     else:
-        masks_path = "/geofiles/train_10/geofiles"
+        masks_path = (
+            "/geofiles/train_10/backfill/geofiles"
+            if use_backfill
+            else "/geofiles/train_10/geofiles"
+        )
         crosswalks_path = "/scratch"
         output_path = crosswalks_path
 
@@ -424,9 +528,9 @@ def grow_cut(
             final_spans.append(span)
 
     # Save the refined crosswalks
-    spans_gdf = gpd.GeoDataFrame(geometry=final_spans, crs="EPSG:3857").to_crs(
-        "EPSG:4326"
-    )
+    spans_gdf = gpd.GeoDataFrame(geometry=final_spans, crs="EPSG:3857")
+    spans_gdf = merge_thickening_cleanup(spans_gdf)
+    spans_gdf = spans_gdf.to_crs("EPSG:4326")
     spans_gdf.to_file(
         f"{output_path}/refined_crosswalks_{version_out}.geojson", driver="GeoJSON"
     )

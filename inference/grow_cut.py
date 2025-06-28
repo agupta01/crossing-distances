@@ -410,14 +410,14 @@ def compute_grow_cut(row):
 )
 def grow_cut(
     version_in: str = "2.0.0",
-    version_out: str = f"3.0.3",
+    version_out: str = f"3.0.4",
     use_backfill: bool = True,
 ):
     """Runs the grow-cut algorithm on the crosswalks to refine their boundaries.
 
     Arguments:
         version_in: The version of the crosswalk edges (SemVer). Defaults to 2.0.0.
-        version_out: The output version to set for this run (SemVer). Defaults to 3.0.3.
+        version_out: The output version to set for this run (SemVer). Defaults to 3.0.4.
         use_backfill: Whether to use the backfilled masks. Defaults to True
 
     Inputs:
@@ -548,9 +548,6 @@ def grow_cut(
     spans_gdf_coords["length_ft"] = spans_gdf["geometry"].length * 3.28084
     spans_gdf_coords.to_csv(
         f"{output_path}/refined_crosswalks_{version_out}.csv", index=False
-    )
-    spans_gdf_coords.to_file(
-        f"{output_path}/refined_crosswalks_{version_out}.kml", driver="KML"
     )
 
 

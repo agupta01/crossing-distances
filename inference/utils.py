@@ -25,7 +25,7 @@ trunc_explanation = (
 
 osmnx_image = (
     modal.Image.from_registry("gboeing/osmnx:latest")
-    .pip_install("geopy", "semver>=3.0.4")
+    .pip_install("geopy", "semver>=3.0.4", "fiona")
     .env({"TINI_SUBREAPER": "1"})
 )
 

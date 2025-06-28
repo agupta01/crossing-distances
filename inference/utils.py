@@ -4,6 +4,9 @@ import os
 from collections import namedtuple
 from io import BytesIO
 import pandas as pd
+from typing import Literal
+import geopandas as gpd
+from pyproj import CRS
 
 import modal
 
@@ -262,3 +265,67 @@ def fuzzy_search_optimized(
                 break
 
     return best_match
+
+
+def get_equidistant_crs(
+    gdf: gpd.GeoDataFrame,
+    units: Literal["Foot", "Meter"] = "Meter",
+) -> CRS:
+    """
+    Creates a CRS that is azimuthally equidistant with respect to the center of the
+    geometries in the GeoDataFrame.
+
+    Args:
+        gdf: GeoDataFrame with geometries to create a CRS for
+        units: Units to use for the CRS. Defaults to "Meter"
+
+    Returns:
+        CRS: CRS object
+    """
+    # Get the center of the geometries
+    bounding_box = gdf.to_crs("EPSG:4326").total_bounds
+
+    central_meridian = (bounding_box[0] + bounding_box[2]) / 2
+    latitude_of_origin = (bounding_box[1] + bounding_box[3]) / 2
+
+    _WKT = f"""
+    PROJCS["ProjWiz_Custom_Azimuthal_Equidistant",
+    GEOGCS["GCS_WGS_1984",
+    DATUM["D_WGS_1984",
+    SPHEROID["WGS_1984",6378137.0,298.257223563]],
+    PRIMEM["Greenwich",0.0],
+    UNIT["Degree",0.0174532925199433]],
+    PROJECTION["Azimuthal_Equidistant"],
+    PARAMETER["False_Easting",0.0],
+    PARAMETER["False_Northing",0.0],
+    PARAMETER["Central_Meridian",{central_meridian}],
+    PARAMETER["Latitude_Of_Origin",{latitude_of_origin}],
+    UNIT["{units}",1.0]]
+    """
+
+    # Create a CRS that is azimuthally equidistant with respect to the center
+    return CRS.from_wkt(_WKT)
+
+
+def set_equidistant_crs(
+    gdf: gpd.GeoDataFrame,
+    units: Literal["Foot", "Meter"] = "Meter",
+    return_crs: bool = False,
+):
+    """
+    Sets the CRS of a GeoDataFrame to an azimuthally equidistant CRS with respect to the
+    center of the geometries in the GeoDataFrame.
+
+    Args:
+        gdf: GeoDataFrame to set the CRS of
+        units: Units to use for the CRS. Defaults to "Foot"
+        return_crs: Whether to return the CRS object. Defaults to False
+
+    Returns:
+        GeoDataFrame: GeoDataFrame with the CRS set
+        CRS: CRS object if return_crs is True
+    """
+    crs = get_equidistant_crs(gdf, units)
+    if return_crs:
+        return gdf.to_crs(crs), crs
+    return gdf.to_crs(crs)

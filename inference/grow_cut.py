@@ -9,7 +9,13 @@ from shapely.geometry import LineString, MultiLineString, Polygon, Point
 from tqdm import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
 
-from inference.utils import EPSILON, app, create_logger, osmnx_image
+from inference.utils import (
+    EPSILON,
+    app,
+    create_logger,
+    osmnx_image,
+    set_equidistant_crs,
+)
 from inference.osm_utils import compute_heading
 import geopandas as gpd
 
@@ -271,9 +277,9 @@ def merge_thickening_cleanup(crosswalks_gdf, lateral_buffer=2, heading_tol=10):
     # Ensure we're in EPSG:3857
     if crosswalks_gdf.crs and not crosswalks_gdf.crs.is_projected:
         print(
-            "Crosswalks GeoDataFrame must be projected to accurately compute intersections. Projecting to EPSG:3857..."
+            "Crosswalks GeoDataFrame must be projected to accurately compute intersections. Projecting..."
         )
-        crosswalks_gdf = crosswalks_gdf.to_crs("EPSG:3857")
+        crosswalks_gdf = set_equidistant_crs(crosswalks_gdf)
 
     # Graph to find clusters
     G = nx.Graph()
@@ -341,7 +347,7 @@ def merge_thickening_cleanup(crosswalks_gdf, lateral_buffer=2, heading_tol=10):
 
     return gpd.GeoDataFrame(
         geometry=new_crosswalks,
-        crs="EPSG:3857",
+        crs=crosswalks_gdf.crs,
         index=new_ids,
     )
 
@@ -404,7 +410,7 @@ def compute_grow_cut(row):
 )
 def grow_cut(
     version_in: str = "2.0.0",
-    version_out: str = f"3.0.1",
+    version_out: str = f"3.0.2",
     use_backfill: bool = True,
 ):
     """Runs the grow-cut algorithm on the crosswalks to refine their boundaries.
@@ -457,10 +463,13 @@ def grow_cut(
 
     version_in, version_out = tuple(map(_parse_semver, (version_in, version_out)))
 
-    masks = gpd.read_file(f"{masks_path}/cross_walks.geojson").to_crs("EPSG:3857")
+    masks, crs = set_equidistant_crs(
+        gpd.read_file(f"{masks_path}/cross_walks.geojson").to_crs("EPSG:3857"),
+        return_crs=True,
+    )
     crosswalks = gpd.read_file(
         f"{crosswalks_path}/crosswalk_edges_{version_in}.shp"
-    ).to_crs("EPSG:3857")
+    ).to_crs(crs)
 
     # Preprocess crosswalk geometries: normalize, drop duplicates, and assign unique UUIDs to null osmids
     crosswalks["geometry"] = crosswalks["geometry"].apply(lambda g: g.normalize())
@@ -528,11 +537,20 @@ def grow_cut(
             final_spans.append(span)
 
     # Save the refined crosswalks
-    spans_gdf = gpd.GeoDataFrame(geometry=final_spans, crs="EPSG:3857")
-    spans_gdf = merge_thickening_cleanup(spans_gdf)
-    spans_gdf = spans_gdf.to_crs("EPSG:4326")
-    spans_gdf.to_file(
+    spans_gdf = gpd.GeoDataFrame(geometry=final_spans, crs=crs)
+    spans_gdf = merge_thickening_cleanup(set_equidistant_crs(spans_gdf))
+    spans_gdf_coords = spans_gdf.to_crs("EPSG:4326")
+    spans_gdf_coords.to_file(
         f"{output_path}/refined_crosswalks_{version_out}.geojson", driver="GeoJSON"
+    )
+
+    # Save a CSV with lengths in feet along with a kml in feet
+    spans_gdf_coords["length_ft"] = spans_gdf["geometry"].length * 3.28084
+    spans_gdf_coords.to_csv(
+        f"{output_path}/refined_crosswalks_{version_out}.csv", index=False
+    )
+    spans_gdf_coords.to_file(
+        f"{output_path}/refined_crosswalks_{version_out}.kml", driver="KML"
     )
 
 

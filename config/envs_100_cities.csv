@@ -1,0 +1,102 @@
+Rank,Title,State,Code,Wave
+17,San Francisco,California,SFO,4
+63,Irvine,California,IRV,8
+2,Los Angeles,California,LAX,9
+1,New York City,New York,JFK,10
+25,Boston,Massachusetts,BOS,6
+22,Washington DC, ,DCA,9
+18,Seattle,Washington,SEA,3
+4,Houston,Texas,IAH,7
+9,Dallas,Texas,DAL,2
+3,Chicago,Illinois,ORD,8
+5,Phoenix,Arizona,PHX,6
+6,Philadelphia,Pennsylvania,PHL,5
+7,San Antonio,Texas,SAT,4
+8,San Diego,California,SAN,3
+10,Jacksonville,Florida,JAX,1
+11,Austin,Texas,AUS,10
+12,Fort Worth,Texas,FTW,9
+13,San Jose,California,SJC,8
+14,Columbus,Ohio,CMH,7
+15,Charlotte,North Carolina,CLT,6
+16,Indianapolis,Indiana,IND,5
+19,Denver,Colorado,DEN,2
+20,Oklahoma City,Oklahoma,OKC,1
+21,Nashville,Tennessee,BNA,10
+23,El Paso,Texas,ELP,8
+24,Las Vegas,Nevada,LAS,7
+26,Detroit,Michigan,DTW,5
+27,Portland,Oregon,PDX,4
+28,Louisville,Kentucky,SDF,3
+29,Memphis,Tennessee,MEM,2
+30,Baltimore,Maryland,BWI,1
+31,Milwaukee,Wisconsin,MKE,10
+32,Albuquerque,New Mexico,ABQ,9
+33,Tucson,Arizona,TUS,8
+34,Fresno,California,FAT,7
+35,Sacramento,California,SMF,6
+36,Mesa,Arizona,AZA,5
+37,Atlanta,Georgia,ATL,4
+38,Kansas City,Missouri,KCI,3
+39,Colorado Springs,Colorado,COS,2
+40,Omaha,Nebraska,OMA,1
+21,Raleigh,North Carolina,RDU,10
+42,Miami,Florida,MIA,9
+43,Virginia Beach,Virginia,NTU,8
+44,Long Beach,California,LGB,7
+45,Oakland,California,OAK,6
+46,Minneapolis,Minnesota,MSP,5
+47,Bakersfield,California,BFL,4
+48,Tulsa,Oklahoma,TUL,3
+49,Tampa,Florida,TPA,2
+50,Arlington,Texas,GKY,1
+51,Wichita,Kansas,ICT,10
+52,Aurora,Colorado,APA,9
+53,New Orleans,Louisiana,MSY,8
+54,Cleveland,Ohio,CLE,7
+55,Honululu,Hawaii,HNL,6
+56,Anaheim,California,ANA,5
+57,Henderson,Nevada,HSH,4
+58,Orlando,Florida,MCO,3
+59,Lexington,Kentucky,LEX,2
+60,Stockton,California,SCK,1
+61,Riverside,California,RAL,10
+62,Corpus Christi,Texas,CRP,9
+64,Cincinnati,Ohio,CVG,7
+65,Santa Ana,California,SNA,6
+66,Newark,New Jersey,EWR,5
+67,Saint Paul,Minnesota,STP,4
+68,Pittsburgh,Pennsylvania,PIT,3
+69,Greensboro,North Carolina,GSO,2
+70,Durham,North Carolina,DUR,1
+71,Lincoln,Nebraska,LNK,10
+72,Jersey City,New Jersey,JER,9
+73,Plano,Texas,PLA,8
+74,Anchorage,Alaska,ANC,7
+75,North Las Vegas,Nevada,VGT,6
+76,St. Louis,Missouri,STL,5
+77,Madison,Wisconsin,MSN,4
+78,Chandler,Arizona,CHD,3
+79,Gilbert,Arizona,GIL,2
+80,Reno,Nevada,RNO,1
+81,Buffalo,New York,BUF,10
+82,Chula Vista,California,CHU,9
+83,Fort Wayne,Indiana,FWA,8
+84,Lubbock,Texas,LBB,7
+85,Toledo,Ohio,TOL,6
+86,St. Petersburg,Florida,PIE,5
+87,Laredo,Texas,LRD,4
+88,Irving,Texas,IVG,3
+89,Chesapeake,Virginia,CPK,2
+90,Glendale,Arizona,GEU,1
+91,Winston-Salem,North Carolina,INT,10
+92,Port St. Lucie,Florida,SUA,9
+93,Scottsdale,Arizona,SDL,8
+94,Garland,Texas,GAR,7
+95,Boise,Idaho,BOI,6
+96,Norfolk,Virginia,ORF,5
+97,Spokane,Washington,GEG,4
+98,Richmond,Virginia,RIC,3
+99,Fremont,California,FRE,2
+100,Huntsville,Alabama,HSV,1
+101,Frisco,Texas,FRI,10

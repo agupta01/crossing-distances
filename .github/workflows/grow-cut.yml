@@ -1,0 +1,410 @@
+name: Grow Cut
+
+on:
+  workflow_dispatch:
+
+env:
+  MODAL_ENVIRONMENT: main
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      setup-complete: ${{ steps.setup.outputs.complete }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Sync project dependencies
+        run: uv sync
+
+      - name: Install modal CLI
+        run: uv pip install modal
+
+      - name: Configure modal
+        run: |
+          uv run modal token set --token-id ${{ secrets.MODAL_TOKEN_ID }} --token-secret ${{ secrets.MODAL_TOKEN_SECRET }}
+
+      - name: Cache uv environment
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cache/uv
+            .venv
+          key: ${{ runner.os }}-uv-${{ hashFiles('**/uv.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-uv-
+
+      - name: Mark setup complete
+        id: setup
+        run: echo "complete=true" >> $GITHUB_OUTPUT
+
+  wave-1:
+    needs: setup
+    runs-on: ubuntu-latest
+    if: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Restore cache
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cache/uv
+            .venv
+          key: ${{ runner.os }}-uv-${{ hashFiles('**/uv.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-uv-
+
+      - name: Quick setup
+        run: |
+          uv sync
+          uv pip install modal
+          uv run modal token set --token-id ${{ secrets.MODAL_TOKEN_ID }} --token-secret ${{ secrets.MODAL_TOKEN_SECRET }}
+
+      - name: Deploy grow-cut for wave 1
+        run: |
+          uv run python -m inference.cli deploy --functions-file inference/grow_cut.py --envs-path ${{ github.workspace }}/config/envs_100_cities.csv --subset JAX,OKC,BWI,OMA,GKY,SCK,DUR,RNO,GEU,HSV
+
+      - name: Run grow-cut for wave 1
+        run: |
+          uv run python -m inference.cli run --function grow_cut --envs-path ${{ github.workspace }}/config/envs_100_cities.csv --subset JAX,OKC,BWI,OMA,GKY,SCK,DUR,RNO,GEU,HSV
+
+  wave-2:
+    needs: wave-1
+    runs-on: ubuntu-latest
+    if: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Restore cache
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cache/uv
+            .venv
+          key: ${{ runner.os }}-uv-${{ hashFiles('**/uv.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-uv-
+
+      - name: Quick setup
+        run: |
+          uv sync
+          uv pip install modal
+          uv run modal token set --token-id ${{ secrets.MODAL_TOKEN_ID }} --token-secret ${{ secrets.MODAL_TOKEN_SECRET }}
+
+      - name: Deploy grow-cut for wave 2
+        run: |
+          uv run python -m inference.cli deploy --functions-file inference/grow_cut.py --envs-path ${{ github.workspace }}/config/envs_100_cities.csv --subset DAL,DEN,MEM,COS,TPA,LEX,GSO,GIL,CPK,FRE
+
+      - name: Run grow-cut for wave 2
+        run: |
+          uv run python -m inference.cli run --function grow_cut --envs-path ${{ github.workspace }}/config/envs_100_cities.csv --subset DAL,DEN,MEM,COS,TPA,LEX,GSO,GIL,CPK,FRE
+
+  wave-3:
+    needs: wave-2
+    runs-on: ubuntu-latest
+    if: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Restore cache
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cache/uv
+            .venv
+          key: ${{ runner.os }}-uv-${{ hashFiles('**/uv.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-uv-
+
+      - name: Quick setup
+        run: |
+          uv sync
+          uv pip install modal
+          uv run modal token set --token-id ${{ secrets.MODAL_TOKEN_ID }} --token-secret ${{ secrets.MODAL_TOKEN_SECRET }}
+
+      - name: Deploy grow-cut for wave 3
+        run: |
+          uv run python -m inference.cli deploy --functions-file inference/grow_cut.py --envs-path ${{ github.workspace }}/config/envs_100_cities.csv --subset SEA,SAN,SDF,KCI,TUL,MCO,PIT,CHD,IVG,RIC
+
+      - name: Run grow-cut for wave 3
+        run: |
+          uv run python -m inference.cli run --function grow_cut --envs-path ${{ github.workspace }}/config/envs_100_cities.csv --subset SEA,SAN,SDF,KCI,TUL,MCO,PIT,CHD,IVG,RIC
+
+  wave-4:
+    needs: wave-3
+    runs-on: ubuntu-latest
+    if: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Restore cache
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cache/uv
+            .venv
+          key: ${{ runner.os }}-uv-${{ hashFiles('**/uv.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-uv-
+
+      - name: Quick setup
+        run: |
+          uv sync
+          uv pip install modal
+          uv run modal token set --token-id ${{ secrets.MODAL_TOKEN_ID }} --token-secret ${{ secrets.MODAL_TOKEN_SECRET }}
+
+      - name: Deploy grow-cut for wave 4
+        run: |
+          uv run python -m inference.cli deploy --functions-file inference/grow_cut.py --envs-path ${{ github.workspace }}/config/envs_100_cities.csv --subset SFO,SAT,PDX,ATL,BFL,HSH,STP,MSN,LRD,GEG
+
+      - name: Run grow-cut for wave 4
+        run: |
+          uv run python -m inference.cli run --function grow_cut --envs-path ${{ github.workspace }}/config/envs_100_cities.csv --subset SFO,SAT,PDX,ATL,BFL,HSH,STP,MSN,LRD,GEG
+
+  wave-5:
+    needs: wave-4
+    runs-on: ubuntu-latest
+    if: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Restore cache
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cache/uv
+            .venv
+          key: ${{ runner.os }}-uv-${{ hashFiles('**/uv.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-uv-
+
+      - name: Quick setup
+        run: |
+          uv sync
+          uv pip install modal
+          uv run modal token set --token-id ${{ secrets.MODAL_TOKEN_ID }} --token-secret ${{ secrets.MODAL_TOKEN_SECRET }}
+
+      - name: Deploy grow-cut for wave 5
+        run: |
+          uv run python -m inference.cli deploy --functions-file inference/grow_cut.py --envs-path ${{ github.workspace }}/config/envs_100_cities.csv --subset PHL,IND,DTW,AZA,MSP,ANA,EWR,STL,PIE,ORF
+
+      - name: Run grow-cut for wave 5
+        run: |
+          uv run python -m inference.cli run --function grow_cut --envs-path ${{ github.workspace }}/config/envs_100_cities.csv --subset PHL,IND,DTW,AZA,MSP,ANA,EWR,STL,PIE,ORF
+
+  wave-6:
+    needs: wave-5
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Restore cache
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cache/uv
+            .venv
+          key: ${{ runner.os }}-uv-${{ hashFiles('**/uv.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-uv-
+
+      - name: Quick setup
+        run: |
+          uv sync
+          uv pip install modal
+          uv run modal token set --token-id ${{ secrets.MODAL_TOKEN_ID }} --token-secret ${{ secrets.MODAL_TOKEN_SECRET }}
+
+      - name: Deploy grow-cut for wave 6
+        run: |
+          uv run python -m inference.cli deploy --functions-file inference/grow_cut.py --envs-path ${{ github.workspace }}/config/envs_100_cities.csv --subset BOS,PHX,CLT,SMF,OAK,HNL,SNA,VGT,TOL,BOI
+
+      - name: Run grow-cut for wave 6
+        run: |
+          uv run python -m inference.cli run --function grow_cut --envs-path ${{ github.workspace }}/config/envs_100_cities.csv --subset BOS,PHX,CLT,SMF,OAK,HNL,SNA,VGT,TOL,BOI
+
+  wave-7:
+    needs: wave-6
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Restore cache
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cache/uv
+            .venv
+          key: ${{ runner.os }}-uv-${{ hashFiles('**/uv.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-uv-
+
+      - name: Quick setup
+        run: |
+          uv sync
+          uv pip install modal
+          uv run modal token set --token-id ${{ secrets.MODAL_TOKEN_ID }} --token-secret ${{ secrets.MODAL_TOKEN_SECRET }}
+
+      - name: Deploy grow-cut for wave 7
+        run: |
+          uv run python -m inference.cli deploy --functions-file inference/grow_cut.py --envs-path ${{ github.workspace }}/config/envs_100_cities.csv --subset IAH,CMH,LAS,FAT,LGB,CLE,CVG,ANC,LBB,GAR
+
+      - name: Run grow-cut for wave 7
+        run: |
+          uv run python -m inference.cli run --function grow_cut --envs-path ${{ github.workspace }}/config/envs_100_cities.csv --subset IAH,CMH,LAS,FAT,LGB,CLE,CVG,ANC,LBB,GAR
+
+  wave-8:
+    needs: wave-7
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Restore cache
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cache/uv
+            .venv
+          key: ${{ runner.os }}-uv-${{ hashFiles('**/uv.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-uv-
+
+      - name: Quick setup
+        run: |
+          uv sync
+          uv pip install modal
+          uv run modal token set --token-id ${{ secrets.MODAL_TOKEN_ID }} --token-secret ${{ secrets.MODAL_TOKEN_SECRET }}
+
+      - name: Deploy grow-cut for wave 8
+        run: |
+          uv run python -m inference.cli deploy --functions-file inference/grow_cut.py --envs-path ${{ github.workspace }}/config/envs_100_cities.csv --subset IRV,ORD,SJC,ELP,TUS,NTU,MSY,PLA,FWA,SDL
+
+      - name: Run grow-cut for wave 8
+        run: |
+          uv run python -m inference.cli run --function grow_cut --envs-path ${{ github.workspace }}/config/envs_100_cities.csv --subset IRV,ORD,SJC,ELP,TUS,NTU,MSY,PLA,FWA,SDL
+
+  wave-9:
+    needs: wave-8
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Restore cache
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cache/uv
+            .venv
+          key: ${{ runner.os }}-uv-${{ hashFiles('**/uv.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-uv-
+
+      - name: Quick setup
+        run: |
+          uv sync
+          uv pip install modal
+          uv run modal token set --token-id ${{ secrets.MODAL_TOKEN_ID }} --token-secret ${{ secrets.MODAL_TOKEN_SECRET }}
+
+      - name: Deploy grow-cut for wave 9
+        run: |
+          uv run python -m inference.cli deploy --functions-file inference/grow_cut.py --envs-path ${{ github.workspace }}/config/envs_100_cities.csv --subset LAX,DCA,FTW,ABQ,MIA,APA,CRP,JER,CHU,SUA
+
+      - name: Run grow-cut for wave 9
+        run: |
+          uv run python -m inference.cli run --function grow_cut --envs-path ${{ github.workspace }}/config/envs_100_cities.csv --subset LAX,DCA,FTW,ABQ,MIA,APA,CRP,JER,CHU,SUA
+
+  wave-10:
+    needs: wave-9
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Restore cache
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cache/uv
+            .venv
+          key: ${{ runner.os }}-uv-${{ hashFiles('**/uv.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-uv-
+
+      - name: Quick setup
+        run: |
+          uv sync
+          uv pip install modal
+          uv run modal token set --token-id ${{ secrets.MODAL_TOKEN_ID }} --token-secret ${{ secrets.MODAL_TOKEN_SECRET }}
+
+      - name: Deploy grow-cut for wave 10
+        run: |
+          uv run python -m inference.cli deploy --functions-file inference/grow_cut.py --envs-path ${{ github.workspace }}/config/envs_100_cities.csv --subset JFK,AUS,BNA,MKE,RDU,ICT,RAL,LNK,BUF,INT,FRI
+
+      - name: Run grow-cut for wave 10
+        run: |
+          uv run python -m inference.cli run --function grow_cut --envs-path ${{ github.workspace }}/config/envs_100_cities.csv --subset JFK,AUS,BNA,MKE,RDU,ICT,RAL,LNK,BUF,INT,FRI

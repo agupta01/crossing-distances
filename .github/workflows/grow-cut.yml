@@ -230,7 +230,6 @@ jobs:
           uv run python -m inference.cli run --function grow_cut --envs-path ${{ github.workspace }}/config/envs_100_cities.csv --subset PHL,IND,DTW,AZA,MSP,ANA,EWR,STL,PIE,ORF
 
   wave-6:
-    needs: wave-5
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository

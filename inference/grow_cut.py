@@ -443,7 +443,7 @@ def grow_cut(
     else:
         masks_path = (
             "/geofiles/train_10/backfill/geofiles"
-            if use_backfill
+            if use_backfill and os.environ['MODAL_ENVIRONMENT'] != 'fri' # Frisco doesn't have backfill
             else "/geofiles/train_10/geofiles"
         )
         crosswalks_path = "/scratch"
